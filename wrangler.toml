@@ -1,13 +1,9 @@
 name = "yt-bulk-uploader-api"
-main = "backend/src/index.ts"
-compatibility_date = "2024-09-01"
-compatibility_flags = ["nodejs_compat"]
+main = "src/index.ts"
+compatibility_date = "2024-02-01"
 
+# D1 Database Binding
 [[d1_databases]]
 binding = "DB"
-database_name = "yt_uploader_db_local"
-database_id = "local-db-placeholder"
-
-[vars]
-GOOGLE_REDIRECT_URI = "http://localhost:8787/api/auth/callback"
-FRONTEND_URL = "http://localhost:5173"
+database_name = "yt-bulk-uploader-db"
+database_id = "4b62cdd7-19ff-4fb7-bde7-993e9d01ae8d"
