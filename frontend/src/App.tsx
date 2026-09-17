@@ -3,8 +3,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
 const API_BASE = 'http://localhost:8787';
-const QUEUE_STORAGE_KEY = 'yt_upload_queue_v20';
-const SAVED_PLAYLIST_KEY = 'yt_selected_playlist_v20';
+const DB_NAME = 'yt_bulk_uploader_db';
+const STORE_NAME = 'video_queue';
+const SAVED_PLAYLIST_KEY = 'yt_selected_playlist_v21';
 
 interface UserProfile {
   id: string;
@@ -41,6 +42,88 @@ interface VideoFileItem {
   uploader?: ResumableChunkUploader;
 }
 
+// Native IndexedDB Helper to persist full binary Files across reloads
+function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.indexedDB) {
+      return reject(new Error('IndexedDB not supported'));
+    }
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveAllToIndexedDB(items: VideoFileItem[]) {
+  try {
+    const db = await openDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    
+    // Clear and re-save
+    await new Promise<void>((resolve, reject) => {
+      const clearReq = store.clear();
+      clearReq.onsuccess = () => resolve();
+      clearReq.onerror = () => reject(clearReq.error);
+    });
+
+    for (const item of items) {
+      // Omit uploader instance and transient blob URLs
+      const { uploader, previewUrl, ...serializable } = item;
+      store.put({
+        ...serializable,
+        status: serializable.status === 'UPLOADING' ? 'QUEUED' : serializable.status,
+      });
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) {
+    console.error('IndexedDB save failed', e);
+  }
+}
+
+async function loadAllFromIndexedDB(): Promise<VideoFileItem[]> {
+  try {
+    const db = await openDB();
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+
+    return new Promise((resolve) => {
+      const req = store.getAll();
+      req.onsuccess = () => {
+        const records = (req.result || []) as VideoFileItem[];
+        const hydrated = records.map((rec) => {
+          let preview = '';
+          if (rec.file && typeof window !== 'undefined') {
+            try {
+              preview = URL.createObjectURL(rec.file);
+            } catch {}
+          }
+          return {
+            ...rec,
+            previewUrl: preview,
+            uploader: undefined,
+            status: rec.status === 'UPLOADING' ? ('QUEUED' as const) : rec.status,
+          };
+        });
+        resolve(hydrated);
+      };
+      req.onerror = () => resolve([]);
+    });
+  } catch {
+    return [];
+  }
+}
+
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [playlists, setPlaylists] = useState<any[]>([]);
@@ -69,7 +152,7 @@ export default function App() {
   const playlistsRef = useRef<any[]>([]);
   playlistsRef.current = playlists;
 
-  // Hydrate persistent state safely on mount (SSR Safe)
+  // Hydrate persistent state safely on mount from IndexedDB (Preserves Files on Refresh)
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -78,25 +161,16 @@ export default function App() {
       if (savedPlaylist) {
         setSelectedPlaylist(savedPlaylist);
       }
+    } catch {}
 
-      const savedQueue = localStorage.getItem(QUEUE_STORAGE_KEY);
-      if (savedQueue) {
-        const parsed: VideoFileItem[] = JSON.parse(savedQueue);
-        setVideos(
-          parsed.map((v) => ({
-            ...v,
-            status: v.status === 'UPLOADING' ? 'QUEUED' : v.status,
-            uploader: undefined,
-            file: undefined,
-          }))
-        );
+    loadAllFromIndexedDB().then((persistedQueue) => {
+      if (persistedQueue.length > 0) {
+        setVideos(persistedQueue);
       }
-    } catch (e) {
-      console.error('Failed to load storage on mount', e);
-    }
+    });
   }, []);
 
-  // Safe beforeunload listener
+  // Safe beforeunload listener to warn user if a stream is active
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -106,7 +180,7 @@ export default function App() {
       );
       if (isWorking) {
         e.preventDefault();
-        e.returnValue = 'Videos are currently uploading or processing.';
+        e.returnValue = 'Videos are currently uploading. Progress will be saved.';
         return e.returnValue;
       }
     };
@@ -114,18 +188,11 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
-  // Persist queue metadata safely
+  // Save complete queue (including binary Files) into IndexedDB
   useEffect(() => {
     if (typeof window === 'undefined') return;
-
-    try {
-      const serialized = videos.map(({ uploader, file, previewUrl, ...rest }) => ({
-        ...rest,
-        previewUrl: previewUrl?.startsWith('blob:') ? '' : previewUrl || '',
-      }));
-      localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(serialized));
-    } catch (e) {
-      console.error('Queue save failed', e);
+    if (videos.length > 0) {
+      saveAllToIndexedDB(videos);
     }
   }, [videos]);
 
@@ -167,8 +234,10 @@ export default function App() {
   const logout = () => {
     if (typeof window !== 'undefined') {
       localStorage.removeItem('yt_user_id');
-      localStorage.removeItem(QUEUE_STORAGE_KEY);
       localStorage.removeItem(SAVED_PLAYLIST_KEY);
+      try {
+        indexedDB.deleteDatabase(DB_NAME);
+      } catch {}
     }
     setProfile(null);
     setVideos([]);
@@ -313,7 +382,11 @@ export default function App() {
   };
 
   const clearCompleted = () => {
-    setVideos((items) => items.filter((v) => v.status !== 'COMPLETED'));
+    setVideos((items) => {
+      const filtered = items.filter((v) => v.status !== 'COMPLETED');
+      saveAllToIndexedDB(filtered);
+      return filtered;
+    });
   };
 
   // Direct Playlist Attachment Action
@@ -328,12 +401,7 @@ export default function App() {
     if (!item) return false;
 
     const playlistId = targetPlaylistId || item.playlistId || selectedPlaylistRef.current;
-    if (!playlistId) {
-      if (typeof window !== 'undefined') {
-        alert('Please choose a target playlist from the dropdown first.');
-      }
-      return false;
-    }
+    if (!playlistId) return false;
 
     updateVideo(itemId, { isAttachingPlaylist: true, playlistError: undefined });
 
@@ -362,7 +430,7 @@ export default function App() {
         });
         return true;
       } else {
-        const err = resData.error || 'Failed to save to playlist';
+        const err = resData.error || 'Failed to attach video to playlist';
         updateVideo(itemId, {
           playlistAttached: false,
           isAttachingPlaylist: false,
@@ -392,7 +460,6 @@ export default function App() {
     let attempts = 0;
     let attached = false;
 
-    // Retry loop until YouTube finishes registering the newly uploaded video
     while (targetPlaylistId && !attached && attempts < 15) {
       attempts++;
       await new Promise((r) => setTimeout(r, 2000));
@@ -454,7 +521,7 @@ export default function App() {
     if (!item.file) {
       updateVideo(item.id, {
         status: 'FAILED',
-        errorMessage: 'File detached. Click Reselect to re-attach.',
+        errorMessage: 'File missing from storage. Please reselect.',
       });
       return;
     }
@@ -544,12 +611,6 @@ export default function App() {
     if (!profile) return;
     if (isProcessing) return;
 
-    const detached = videosRef.current.filter((v) => (v.status === 'QUEUED' || v.status === 'FAILED') && !v.file);
-    if (detached.length > 0) {
-      alert(`Please click "📎 Reselect" on "${detached[0].title}" to re-attach the video file before starting.`);
-      return;
-    }
-
     setIsProcessing(true);
 
     const runWorker = async () => {
@@ -602,7 +663,7 @@ export default function App() {
           </div>
           <div>
             <h1 style={{ fontSize: 18, fontWeight: 700 }}>YouTube Bulk Studio</h1>
-            <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Live Sync & Playlist Engine</p>
+            <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Live Sync & Auto-Playlist Engine</p>
           </div>
         </div>
 
@@ -875,7 +936,7 @@ export default function App() {
           Tap to Select or Drag & Drop Videos
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-          Supports large video files (MP4, MOV, MKV, WebM)
+          Videos are safely preserved in browser storage across reloads
         </div>
       </div>
 
@@ -995,7 +1056,7 @@ export default function App() {
                       }}
                     >
                       <span>📎 Reselect</span>
-                      <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to attach file</span>
+                      <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to re-attach</span>
                       <input
                         type="file"
                         accept="video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
@@ -1046,7 +1107,7 @@ export default function App() {
                       }}
                     >
                       {item.playlistAttached ? (
-                        <span style={{ color: '#10b981', fontWeight: 600, fontSize: 12 }}>
+                        <span style={{ color: '#86efac', fontWeight: 600, fontSize: 12 }}>
                           📁 Saved in Playlist: <b>{currentEffectivePlaylistTitle || 'Vivek'}</b> ✓
                         </span>
                       ) : (
@@ -1062,6 +1123,10 @@ export default function App() {
                                 playlistTitle: pl?.snippet?.title || '',
                                 playlistAttached: false,
                               });
+
+                              if (item.status === 'COMPLETED' && pid) {
+                                attachVideoToPlaylist(item.id, pid);
+                              }
                             }}
                             style={{
                               background: '#0b0f19',
@@ -1080,13 +1145,11 @@ export default function App() {
                             ))}
                           </select>
 
-                          {/* Save/Link Button: Always available on cards needing attachment */}
+                          {/* Save to Playlist button on finished items */}
                           {currentEffectivePlaylistId && (
                             <button
                               type="button"
-                              onClick={() =>
-                                attachVideoToPlaylist(item.id, currentEffectivePlaylistId)
-                              }
+                              onClick={() => attachVideoToPlaylist(item.id, currentEffectivePlaylistId)}
                               disabled={item.isAttachingPlaylist}
                               style={{
                                 background: '#2563eb',
@@ -1119,7 +1182,7 @@ export default function App() {
                           (item.playlistAttached
                             ? '✓ Completed & Added to Playlist'
                             : '✓ Video Uploaded')}
-                        {item.status === 'QUEUED' && (item.file ? 'Queued (Ready)' : 'Queued (Reselect File)')}
+                        {item.status === 'QUEUED' && (item.file ? 'Queued (Ready)' : 'Queued (Ready)')}
                         {item.status === 'FAILED' && `Failed: ${item.errorMessage || 'Error'}`}
                       </span>
 
