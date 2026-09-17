@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
 const API_BASE = 'http://localhost:8787';
-const QUEUE_STORAGE_KEY = 'yt_upload_queue_v3';
+const QUEUE_STORAGE_KEY = 'yt_upload_queue_v4';
 
 interface UserProfile {
   id: string;
@@ -64,7 +64,7 @@ export default function App() {
         }));
       }
     } catch (e) {
-      console.error('Failed to load queue from storage', e);
+      console.error('Failed to parse queue storage', e);
     }
     return [];
   });
@@ -72,13 +72,12 @@ export default function App() {
   const videosRef = useRef<VideoFileItem[]>([]);
   videosRef.current = videos;
 
-  // Warn user before reload/navigation during uploads
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       const isUploading = videosRef.current.some((v) => v.status === 'UPLOADING');
       if (isUploading) {
         e.preventDefault();
-        e.returnValue = 'Videos are currently uploading. Reloading will pause progress.';
+        e.returnValue = 'Videos are currently uploading. Reloading will interrupt progress.';
         return e.returnValue;
       }
     };
@@ -86,7 +85,6 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
-  // Save metadata & active session URIs across reloads
   useEffect(() => {
     try {
       const serialized = videos.map(({ uploader, file, previewUrl, ...rest }) => ({
@@ -239,7 +237,7 @@ export default function App() {
     if (!item.file) {
       updateVideo(item.id, {
         status: 'FAILED',
-        errorMessage: 'File detached. Click Reselect to continue.',
+        errorMessage: 'File detached. Click Reselect to re-attach.',
       });
       return;
     }
@@ -249,7 +247,6 @@ export default function App() {
     try {
       let uploadUri = item.uploadUri;
 
-      // 1. Get resumable session URI only if not already initiated
       if (!uploadUri) {
         const initRes = await fetch(`${API_BASE}/api/uploads/initialize`, {
           method: 'POST',
@@ -269,13 +266,12 @@ export default function App() {
 
         const data = await initRes.json();
         if (!data.uploadUri) {
-          throw new Error(data.error || 'Could not acquire upload session from Google');
+          throw new Error(data.error || 'Failed to acquire upload session');
         }
         uploadUri = data.uploadUri;
         updateVideo(item.id, { uploadUri });
       }
 
-      // 2. Stream chunked bytes to YouTube directly
       const uploader = new ResumableChunkUploader(item.file, uploadUri!, (progress) => {
         updateVideo(item.id, {
           progress: progress.percentage,
@@ -286,15 +282,15 @@ export default function App() {
       updateVideo(item.id, { uploader });
       const { videoId } = await uploader.start();
 
-      // Video byte upload is 100% complete
+      // Confirmed Completed
       updateVideo(item.id, {
         status: 'COMPLETED',
         progress: 100,
-        videoId,
+        videoId: videoId || item.videoId,
         errorMessage: undefined,
       });
 
-      // 3. Attach to playlist independently (non-fatal if playlist insertion errors)
+      // Playlist addition (non-blocking)
       if (selectedPlaylist && videoId) {
         try {
           await fetch(`${API_BASE}/api/playlists/attach`, {
@@ -302,15 +298,15 @@ export default function App() {
             headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
             body: JSON.stringify({ playlistId: selectedPlaylist, videoId }),
           });
-        } catch (playlistErr) {
-          console.warn('Playlist attachment error (video was uploaded successfully):', playlistErr);
+        } catch (plErr) {
+          console.warn('Playlist addition notice:', plErr);
         }
       }
     } catch (err: any) {
       console.error(`Upload error for "${item.title}":`, err);
       updateVideo(item.id, {
         status: 'FAILED',
-        errorMessage: err.message || 'Transmission error',
+        errorMessage: err.message || 'Upload error',
       });
     }
   };
@@ -319,12 +315,11 @@ export default function App() {
     if (!profile) return;
     if (isProcessing) return;
 
-    // Verify all pending uploads have their file attached
     const unattached = videosRef.current.filter(
       (v) => (v.status === 'QUEUED' || v.status === 'FAILED') && !v.file
     );
     if (unattached.length > 0) {
-      alert('Please click "Reselect File" on items marked red before starting the upload.');
+      alert('Please re-attach the video files on items marked with "Reselect" first.');
       return;
     }
 
@@ -436,7 +431,7 @@ export default function App() {
           { label: 'Active Uploading', val: uploadingCount, color: '#f59e0b' },
           { label: 'Completed', val: completedCount, color: '#10b981' },
           {
-            label: 'Failed / Needs Action',
+            label: 'Failed / Action Needed',
             val: videos.filter((v) => v.status === 'FAILED').length,
             color: '#ef4444',
           },
@@ -456,7 +451,7 @@ export default function App() {
         ))}
       </div>
 
-      {/* Common Upload Configuration */}
+      {/* Common Configuration */}
       <section
         style={{
           background: 'var(--bg-card)',
@@ -539,7 +534,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Mandatory COPPA Audience Question */}
+        {/* Audience / COPPA */}
         <div
           style={{
             padding: '12px 14px',
@@ -577,7 +572,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Quick Playlist Creation */}
+        {/* Playlist Creation */}
         <div className="playlist-action-row">
           <input
             placeholder="Quick create playlist..."
@@ -610,7 +605,7 @@ export default function App() {
         </div>
       </section>
 
-      {/* Drag & Drop File Picker */}
+      {/* Drag & Drop Target */}
       <div
         onDragOver={(e) => {
           e.preventDefault();
@@ -646,7 +641,7 @@ export default function App() {
           Tap to Select or Drag & Drop Videos
         </div>
         <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
-          MP4, MOV, MKV, WebM supported
+          Supports large video files (MP4, MOV, MKV, WebM)
         </div>
       </div>
 
@@ -703,7 +698,7 @@ export default function App() {
                 boxShadow: isProcessing ? 'none' : '0 4px 14px rgba(239, 68, 68, 0.4)',
               }}
             >
-              {isProcessing ? 'Transmitting Videos In Parallel...' : 'Start Parallel Upload'}
+              {isProcessing ? 'Transmitting In Parallel...' : 'Start Parallel Upload'}
             </button>
           </div>
 
@@ -745,7 +740,7 @@ export default function App() {
                       }}
                     >
                       <span>📎 Reselect</span>
-                      <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to resume</span>
+                      <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to re-attach</span>
                       <input
                         type="file"
                         accept="video/*"
