@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
-const API_BASE = 'http://localhost:8787';
+const API_BASE = '';
 const DB_NAME = 'yt_bulk_uploader_db';
 const STORE_NAME = 'video_queue';
 const SAVED_PLAYLIST_KEY = 'yt_selected_playlist_v21';

@@ -408,6 +408,12 @@ export default {
         );
       }
 
+      // Place this at the end of the fetch function right before the closing bracket:
+      // If the request is not an API call, serve the React frontend static asset
+      if (!url.pathname.startsWith('/api')) {
+        return env.ASSETS.fetch(request);
+      }
+
       return new Response('Not Found', { status: 404, headers });
     } catch (err: any) {
       return Response.json({ error: err.message }, { status: 500, headers });

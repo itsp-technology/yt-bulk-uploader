@@ -1,6 +1,9 @@
-name = "yt-bulk-uploader-api"
+name = "yt-bulk-uploader"
 main = "backend/src/index.ts"
 compatibility_date = "2024-02-01"
+
+# Automatically serve built frontend assets on the same domain
+assets = { directory = "./frontend/dist", binding = "ASSETS", not_found_handling = "single-page-application" }
 
 # D1 Database Binding
 [[d1_databases]]

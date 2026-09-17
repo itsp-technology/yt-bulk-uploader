@@ -1,7 +1,9 @@
 import type { D1Database } from '@cloudflare/workers-types';
 
+// backend/src/types.ts
 export interface Env {
   DB: D1Database;
+  ASSETS: Fetcher;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
   GOOGLE_REDIRECT_URI: string;
