@@ -1,0 +1,12 @@
+{
+  "name": "yt-bulk-uploader",
+  "private": true,
+  "scripts": {
+    "dev:backend": "wrangler dev",
+    "dev:frontend": "npm run dev --prefix frontend"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "wrangler": "^3.78.0"
+  }
+}
