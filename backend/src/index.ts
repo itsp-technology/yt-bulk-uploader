@@ -157,12 +157,14 @@ export default {
         return Response.json(data, { headers });
       }
 
-      // 6. Initialize Resumable Upload
+      // 6. Initialize Resumable Upload (Includes client Origin to enable browser CORS)
       if (url.pathname === '/api/uploads/initialize' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
         const body = (await request.json()) as any;
 
         const mimeType = body.mimeType && body.mimeType.length > 0 ? body.mimeType : 'video/mp4';
+        const clientOrigin = request.headers.get('Origin') || env.FRONTEND_URL || 'http://localhost:5173';
+
         const sanitizedTags = Array.isArray(body.tags)
           ? body.tags.filter((t: string) => t && t.trim().length > 0)
           : (body.tags || '')
@@ -193,6 +195,7 @@ export default {
               'Content-Type': 'application/json; charset=UTF-8',
               'X-Upload-Content-Type': mimeType,
               'X-Upload-Content-Length': String(body.fileSize),
+              Origin: clientOrigin,
             },
             body: JSON.stringify(metadataPayload),
           }
@@ -235,14 +238,73 @@ export default {
         return Response.json({ uploadUri, uploadId }, { headers });
       }
 
-      // 7. Attach Video to Playlist
+      // 7. Attach Video to Playlist (Auto-resolves Video ID by title if missing)
       if (url.pathname === '/api/playlists/attach' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
-        const { playlistId, videoId } = (await request.json()) as any;
+        const { playlistId, videoId, title } = (await request.json()) as any;
 
-        if (!playlistId || !videoId) {
-          return Response.json({ error: 'Missing playlistId or videoId' }, { status: 400, headers });
+        if (!playlistId) {
+          return Response.json({ error: 'Missing playlistId' }, { status: 400, headers });
         }
+
+        let resolvedVideoId = videoId && String(videoId).trim().length > 0 ? String(videoId).trim() : null;
+
+        // Auto-detect videoId from channel uploads if not provided
+        if (!resolvedVideoId && title) {
+          try {
+            const chRes = await fetch(
+              'https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true',
+              { headers: { Authorization: `Bearer ${token}` } }
+            );
+            const chData = (await chRes.json()) as any;
+            const uploadsPlaylistId = chData.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+
+            if (uploadsPlaylistId) {
+              const listRes = await fetch(
+                `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${uploadsPlaylistId}&maxResults=30`,
+                { headers: { Authorization: `Bearer ${token}` } }
+              );
+              const listData = (await listRes.json()) as any;
+              const cleanTitle = String(title).trim().toLowerCase();
+              const match = (listData.items || []).find((it: any) => {
+                const itemTitle = String(it.snippet?.title || '').trim().toLowerCase();
+                return itemTitle === cleanTitle || itemTitle.startsWith(cleanTitle);
+              });
+              if (match) {
+                resolvedVideoId = match.snippet?.resourceId?.videoId;
+              }
+            }
+          } catch (lookupErr) {
+            console.warn('Video ID title lookup notice:', lookupErr);
+          }
+        }
+
+        if (!resolvedVideoId) {
+          return Response.json(
+            { error: 'Could not resolve Video ID. The video may still be transcoding.' },
+            { status: 400, headers }
+          );
+        }
+
+        // Check if video is already inside the target playlist
+        try {
+          const verifyRes = await fetch(
+            `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${playlistId}&maxResults=50`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          if (verifyRes.ok) {
+            const vData = (await verifyRes.json()) as any;
+            const exists = (vData.items || []).some(
+              (it: any) => it.snippet?.resourceId?.videoId === resolvedVideoId
+            );
+            if (exists) {
+              return Response.json(
+                { success: true, alreadyInPlaylist: true, videoId: resolvedVideoId },
+                { headers }
+              );
+            }
+          }
+        } catch {}
 
         let attempts = 0;
         let lastError = '';
@@ -261,7 +323,7 @@ export default {
                 playlistId: playlistId,
                 resourceId: {
                   kind: 'youtube#video',
-                  videoId: videoId,
+                  videoId: resolvedVideoId,
                 },
               },
             }),
@@ -269,20 +331,23 @@ export default {
 
           if (res.ok) {
             const data = await res.json();
-            return Response.json({ success: true, item: data }, { headers });
+            return Response.json({ success: true, item: data, videoId: resolvedVideoId }, { headers });
           }
 
           const errText = await res.text();
           lastError = errText;
 
           if (errText.includes('videoAlreadyInPlaylist')) {
-            return Response.json({ success: true, alreadyInPlaylist: true }, { headers });
+            return Response.json(
+              { success: true, alreadyInPlaylist: true, videoId: resolvedVideoId },
+              { headers }
+            );
           }
 
           if (res.status === 401 || res.status === 403) {
             return Response.json(
               {
-                error: 'Permission Denied: Please Disconnect and Reconnect YouTube account to grant Playlist permissions.',
+                error: 'Permission Denied: Please disconnect and reconnect YouTube to grant playlist write access.',
                 details: errText,
               },
               { status: 403, headers }
@@ -293,46 +358,12 @@ export default {
         }
 
         return Response.json(
-          { error: `Google rejected playlist linking: ${lastError}`, details: lastError },
+          { error: `YouTube Playlist linking rejected: ${lastError}`, details: lastError },
           { status: 500, headers }
         );
       }
 
-      // 8. Instant Channel Uploads Lookup (Accurate & avoids search index lag)
-      if (url.pathname === '/api/uploads/recent-channel-videos' && request.method === 'GET') {
-        const { token, user } = await getValidAccessToken(env, userId);
-
-        let uploadsPlaylistId = '';
-        if (user.channel_id && user.channel_id.startsWith('UC')) {
-          uploadsPlaylistId = 'UU' + user.channel_id.substring(2);
-        } else {
-          const chRes = await fetch(
-            'https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true',
-            { headers: { Authorization: `Bearer ${token}` } }
-          );
-          const chData = (await chRes.json()) as any;
-          uploadsPlaylistId = chData.items?.[0]?.contentDetails?.relatedPlaylists?.uploads || '';
-        }
-
-        if (!uploadsPlaylistId) {
-          return Response.json({ items: [] }, { headers });
-        }
-
-        // Query the channel's actual uploads playlist directly
-        const plRes = await fetch(
-          `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${uploadsPlaylistId}&maxResults=15`,
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-        const plData = (await plRes.json()) as any;
-        const items = (plData.items || []).map((it: any) => ({
-          title: it.snippet?.title,
-          videoId: it.snippet?.resourceId?.videoId,
-        }));
-
-        return Response.json({ items }, { headers });
-      }
-
-      // 9. Processing status
+      // 8. Processing status
       if (url.pathname === '/api/uploads/status' && request.method === 'GET') {
         const videoId = url.searchParams.get('videoId');
         if (!videoId) {

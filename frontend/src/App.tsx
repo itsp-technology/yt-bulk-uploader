@@ -3,8 +3,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
 const API_BASE = 'http://localhost:8787';
-const QUEUE_STORAGE_KEY = 'yt_upload_queue_v16';
-const SAVED_PLAYLIST_KEY = 'yt_selected_playlist_v16';
+const QUEUE_STORAGE_KEY = 'yt_upload_queue_v20';
+const SAVED_PLAYLIST_KEY = 'yt_selected_playlist_v20';
 
 interface UserProfile {
   id: string;
@@ -63,6 +63,13 @@ export default function App() {
   const videosRef = useRef<VideoFileItem[]>([]);
   videosRef.current = videos;
 
+  const selectedPlaylistRef = useRef<string>('');
+  selectedPlaylistRef.current = selectedPlaylist;
+
+  const playlistsRef = useRef<any[]>([]);
+  playlistsRef.current = playlists;
+
+  // Hydrate persistent state safely on mount (SSR Safe)
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -85,10 +92,11 @@ export default function App() {
         );
       }
     } catch (e) {
-      console.error('Failed to load queue storage', e);
+      console.error('Failed to load storage on mount', e);
     }
   }, []);
 
+  // Safe beforeunload listener
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -106,6 +114,7 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
+  // Persist queue metadata safely
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -120,6 +129,7 @@ export default function App() {
     }
   }, [videos]);
 
+  // Read URL query parameters on load
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -249,7 +259,7 @@ export default function App() {
       .filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(f.name))
       .forEach((f) => {
         const existingIndex = videosRef.current.findIndex(
-          (v) => v.fileName === f.name && Math.abs(v.fileSize - f.size) < 1000
+          (v) => v.fileName === f.name || Math.abs(v.fileSize - f.size) < 1000
         );
 
         if (existingIndex !== -1) {
@@ -258,8 +268,8 @@ export default function App() {
             previewUrl: typeof window !== 'undefined' ? URL.createObjectURL(f) : '',
             status: 'QUEUED',
             errorMessage: undefined,
-            playlistId: selectedPlaylist,
-            playlistTitle: currentPlaylist?.snippet?.title,
+            playlistId: selectedPlaylist || videosRef.current[existingIndex].playlistId,
+            playlistTitle: currentPlaylist?.snippet?.title || videosRef.current[existingIndex].playlistTitle,
           });
         } else {
           incoming.push({
@@ -306,27 +316,6 @@ export default function App() {
     setVideos((items) => items.filter((v) => v.status !== 'COMPLETED'));
   };
 
-  // Instant ID recovery: Checks channel's uploads directly
-  const autoRecoverVideoId = async (item: VideoFileItem): Promise<string | null> => {
-    if (item.videoId && item.videoId.trim().length > 0) return item.videoId.trim();
-    if (!profile) return null;
-
-    try {
-      const res = await fetch(`${API_BASE}/api/uploads/recent-channel-videos`, {
-        headers: { 'x-user-id': profile.id },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const found = (data.items || []).find((v: any) => v.title === item.title);
-        if (found && found.videoId) {
-          updateVideo(item.id, { videoId: found.videoId });
-          return found.videoId;
-        }
-      }
-    } catch {}
-    return null;
-  };
-
   // Direct Playlist Attachment Action
   const attachVideoToPlaylist = async (
     itemId: string,
@@ -338,47 +327,42 @@ export default function App() {
     const item = videosRef.current.find((v) => v.id === itemId);
     if (!item) return false;
 
-    const playlistId = targetPlaylistId || item.playlistId || selectedPlaylist;
+    const playlistId = targetPlaylistId || item.playlistId || selectedPlaylistRef.current;
     if (!playlistId) {
       if (typeof window !== 'undefined') {
-        alert('Please choose a playlist from the dropdown.');
+        alert('Please choose a target playlist from the dropdown first.');
       }
       return false;
     }
 
     updateVideo(itemId, { isAttachingPlaylist: true, playlistError: undefined });
 
-    const activeVideoId = explicitVideoId || (await autoRecoverVideoId(item));
-    if (!activeVideoId) {
-      updateVideo(itemId, {
-        isAttachingPlaylist: false,
-        playlistError: 'Could not detect YouTube Video ID. Enter it manually or wait a few seconds.',
-      });
-      return false;
-    }
-
     try {
       const attachRes = await fetch(`${API_BASE}/api/playlists/attach`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
-        body: JSON.stringify({ playlistId, videoId: activeVideoId }),
+        body: JSON.stringify({
+          playlistId,
+          videoId: explicitVideoId || item.videoId || '',
+          title: item.title,
+        }),
       });
 
       const resData = await attachRes.json().catch(() => ({}));
 
       if (attachRes.ok && (resData.success || resData.alreadyInPlaylist)) {
-        const found = playlists.find((p) => p.id === playlistId);
+        const found = playlistsRef.current.find((p) => p.id === playlistId);
         updateVideo(itemId, {
           playlistAttached: true,
           isAttachingPlaylist: false,
           playlistId,
-          videoId: activeVideoId,
-          playlistTitle: found?.snippet?.title || item.playlistTitle || 'Target Playlist',
+          videoId: resData.videoId || item.videoId,
+          playlistTitle: found?.snippet?.title || item.playlistTitle || 'Selected Playlist',
           playlistError: undefined,
         });
         return true;
       } else {
-        const err = resData.error || 'Failed to attach video to playlist';
+        const err = resData.error || 'Failed to save to playlist';
         updateVideo(itemId, {
           playlistAttached: false,
           isAttachingPlaylist: false,
@@ -396,17 +380,33 @@ export default function App() {
     }
   };
 
-  // Background Processing poller
-  const runBackgroundProcessingAndAttach = async (itemId: string, videoId: string, targetPlaylistId?: string) => {
+  // Background Cloud Processing & Automated Playlist Attachment
+  const runBackgroundProcessingAndAttach = async (
+    itemId: string,
+    videoId: string,
+    targetPlaylistId?: string
+  ) => {
     if (!profile) return;
 
     let isDone = false;
     let attempts = 0;
     let attached = false;
 
-    while (!isDone && attempts < 35) {
-      await new Promise((r) => setTimeout(r, 3000));
+    // Retry loop until YouTube finishes registering the newly uploaded video
+    while (targetPlaylistId && !attached && attempts < 15) {
       attempts++;
+      await new Promise((r) => setTimeout(r, 2000));
+      const ok = await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
+      if (ok) {
+        attached = true;
+        break;
+      }
+    }
+
+    let procAttempts = 0;
+    while (!isDone && procAttempts < 30) {
+      await new Promise((r) => setTimeout(r, 3000));
+      procAttempts++;
 
       try {
         const res = await fetch(`${API_BASE}/api/uploads/status?videoId=${videoId}`, {
@@ -416,17 +416,8 @@ export default function App() {
         if (res.ok) {
           const data = await res.json();
 
-          if (targetPlaylistId && !attached && attempts >= 2) {
-            attached = await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
-          }
-
           if (data.processingStatus === 'succeeded' || data.uploadStatus === 'processed') {
             isDone = true;
-
-            if (targetPlaylistId && !attached) {
-              await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
-            }
-
             updateVideo(itemId, {
               status: 'COMPLETED',
               progress: 100,
@@ -444,7 +435,7 @@ export default function App() {
             return;
           }
 
-          const realPercentage = data.percentage > 0 ? data.percentage : Math.min(25 + attempts * 3, 95);
+          const realPercentage = data.percentage > 0 ? data.percentage : Math.min(25 + procAttempts * 3, 95);
           updateVideo(itemId, {
             status: 'PROCESSING',
             processingProgress: realPercentage,
@@ -453,10 +444,6 @@ export default function App() {
       } catch (err) {
         console.warn('Processing status poll error:', err);
       }
-    }
-
-    if (targetPlaylistId && !attached) {
-      await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
     }
 
     updateVideo(itemId, { status: 'COMPLETED', progress: 100, processingProgress: 100 });
@@ -472,7 +459,7 @@ export default function App() {
       return;
     }
 
-    const effectivePlaylistId = item.playlistId || selectedPlaylist;
+    const effectivePlaylistId = item.playlistId || selectedPlaylistRef.current;
     const currentPlaylist = playlists.find((p) => p.id === effectivePlaylistId);
 
     updateVideo(item.id, {
@@ -556,6 +543,12 @@ export default function App() {
   const startParallelUploads = async () => {
     if (!profile) return;
     if (isProcessing) return;
+
+    const detached = videosRef.current.filter((v) => (v.status === 'QUEUED' || v.status === 'FAILED') && !v.file);
+    if (detached.length > 0) {
+      alert(`Please click "📎 Reselect" on "${detached[0].title}" to re-attach the video file before starting.`);
+      return;
+    }
 
     setIsProcessing(true);
 
@@ -751,7 +744,7 @@ export default function App() {
 
           <div>
             <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 }}>
-              Target Playlist
+              Target Playlist (Applied Automatically)
             </label>
             <select
               value={selectedPlaylist}
@@ -1002,7 +995,7 @@ export default function App() {
                       }}
                     >
                       <span>📎 Reselect</span>
-                      <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to re-attach</span>
+                      <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to attach file</span>
                       <input
                         type="file"
                         accept="video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
@@ -1053,8 +1046,8 @@ export default function App() {
                       }}
                     >
                       {item.playlistAttached ? (
-                        <span style={{ color: '#86efac', fontWeight: 600 }}>
-                          📁 Saved in Playlist: <b>{currentEffectivePlaylistTitle || 'Target Playlist'}</b> ✓
+                        <span style={{ color: '#10b981', fontWeight: 600, fontSize: 12 }}>
+                          📁 Saved in Playlist: <b>{currentEffectivePlaylistTitle || 'Vivek'}</b> ✓
                         </span>
                       ) : (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
@@ -1087,12 +1080,12 @@ export default function App() {
                             ))}
                           </select>
 
-                          {/* Save/Link Button: Always visible once a playlist is selected */}
+                          {/* Save/Link Button: Always available on cards needing attachment */}
                           {currentEffectivePlaylistId && (
                             <button
                               type="button"
                               onClick={() =>
-                                attachVideoToPlaylist(item.id, currentEffectivePlaylistId, item.videoId)
+                                attachVideoToPlaylist(item.id, currentEffectivePlaylistId)
                               }
                               disabled={item.isAttachingPlaylist}
                               style={{
@@ -1100,18 +1093,18 @@ export default function App() {
                                 border: 'none',
                                 color: '#fff',
                                 borderRadius: 4,
-                                padding: '3px 8px',
-                                fontSize: 10,
+                                padding: '3px 10px',
+                                fontSize: 11,
                                 fontWeight: 600,
                                 cursor: item.isAttachingPlaylist ? 'not-allowed' : 'pointer',
                               }}
                             >
-                              {item.isAttachingPlaylist ? 'Saving...' : 'Save to Playlist ⟳'}
+                              {item.isAttachingPlaylist ? 'Saving to Playlist...' : 'Save to Playlist ⟳'}
                             </button>
                           )}
 
                           {item.playlistError && (
-                            <span style={{ color: '#f87171', fontSize: 10 }}>({item.playlistError})</span>
+                            <span style={{ color: '#ef4444', fontSize: 11 }}>({item.playlistError})</span>
                           )}
                         </div>
                       )}
@@ -1121,12 +1114,12 @@ export default function App() {
                       <span style={{ fontWeight: 600, color: barColor }}>
                         {isUploadingPhase && `Uploading: ${item.progress}% (${item.speedMBps} MB/s)`}
                         {isProcessingPhase &&
-                          `YouTube Studio Processing: ${item.processingProgress || 15}% (SD/HD Checking...)`}
+                          `YouTube Processing: ${item.processingProgress || 15}% (Linking to Playlist...)`}
                         {item.status === 'COMPLETED' &&
                           (item.playlistAttached
                             ? '✓ Completed & Added to Playlist'
-                            : '✓ Video Uploaded (Click Save to Playlist)')}
-                        {item.status === 'QUEUED' && 'Queued'}
+                            : '✓ Video Uploaded')}
+                        {item.status === 'QUEUED' && (item.file ? 'Queued (Ready)' : 'Queued (Reselect File)')}
                         {item.status === 'FAILED' && `Failed: ${item.errorMessage || 'Error'}`}
                       </span>
 

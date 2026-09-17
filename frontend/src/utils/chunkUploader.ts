@@ -10,7 +10,7 @@ export interface UploadProgress {
 export class ResumableChunkUploader {
   private file: File;
   private uploadUri: string;
-  // Use 10MB chunk size (must be an exact multiple of 256 KiB = 262,144 bytes)
+  // 10MB chunks (must be multiple of 256 KiB = 262,144 bytes)
   private chunkSize = 10 * 1024 * 1024;
   private isPaused = false;
   private isCancelled = false;
@@ -39,14 +39,11 @@ export class ResumableChunkUploader {
         const result = await this.uploadChunkXHR(chunk, startByte, endByte - 1, this.file.size);
 
         if (result.status === 200 || result.status === 201) {
-          // Final chunk received and confirmed
           let videoId = '';
           try {
             const data = JSON.parse(result.responseText);
             videoId = data.id || '';
-          } catch {
-            // Response parsing fallback
-          }
+          } catch {}
 
           this.onProgress({
             bytesUploaded: this.file.size,
@@ -59,7 +56,6 @@ export class ResumableChunkUploader {
         }
 
         if (result.status === 308) {
-          // Chunk accepted, Google requests next range
           const range = result.rangeHeader;
           if (range) {
             const parts = range.split('-');
@@ -81,7 +77,6 @@ export class ResumableChunkUploader {
           throw new Error(`Google rejected chunk with status ${result.status}`);
         }
       } catch (err: any) {
-        // If this was the last chunk and we hit the edge-case socket closure, verify completion
         if (endByte >= this.file.size) {
           await new Promise((r) => setTimeout(r, 1200));
           const verify = await this.checkIfCompleted();
@@ -99,7 +94,6 @@ export class ResumableChunkUploader {
       }
     }
 
-    // Safety verification check
     const finalStatus = await this.checkIfCompleted();
     if (finalStatus.completed) {
       this.onProgress({
@@ -111,7 +105,7 @@ export class ResumableChunkUploader {
       return { videoId: finalStatus.videoId };
     }
 
-    throw new Error('Upload reached end without final status confirmation');
+    throw new Error('Upload finished without video ID confirmation from Google');
   }
 
   private uploadChunkXHR(
@@ -134,7 +128,6 @@ export class ResumableChunkUploader {
       };
 
       xhr.onerror = () => {
-        // If all bytes were dispatched, treat network socket close as a possible completion
         if (endByte + 1 >= totalBytes) {
           resolve({
             status: 200,
@@ -188,12 +181,11 @@ export class ResumableChunkUploader {
             resolve({ completed: true, videoId: '' });
           }
         } else {
-          // If status is 404/410/400 after all bytes sent, Google already finalized ingest
-          resolve({ completed: true, videoId: '' });
+          resolve({ completed: false, videoId: '' });
         }
       };
 
-      xhr.onerror = () => resolve({ completed: true, videoId: '' });
+      xhr.onerror = () => resolve({ completed: false, videoId: '' });
       xhr.send();
     });
   }
