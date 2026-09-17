@@ -111,7 +111,21 @@ export default {
         return Response.json({ error: 'Unauthorized: Missing x-user-id' }, { status: 401, headers });
       }
 
-      // 3. Playlists: List
+      // 3. User Profile & YouTube Details
+      if (url.pathname === '/api/me' && request.method === 'GET') {
+        const user = await env.DB.prepare(
+          'SELECT id, email, name, avatar, channel_id, channel_title FROM users WHERE id = ?'
+        )
+          .bind(userId)
+          .first<any>();
+
+        if (!user) {
+          return Response.json({ error: 'User not found' }, { status: 404, headers });
+        }
+        return Response.json(user, { headers });
+      }
+
+      // 4. Playlists: List
       if (url.pathname === '/api/playlists' && request.method === 'GET') {
         const { token } = await getValidAccessToken(env, userId);
         const res = await fetch(
@@ -122,7 +136,7 @@ export default {
         return Response.json(data.items || [], { headers });
       }
 
-      // 4. Playlists: Create
+      // 5. Playlists: Create
       if (url.pathname === '/api/playlists' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
         const body = (await request.json()) as any;
@@ -142,7 +156,7 @@ export default {
         return Response.json(data, { headers });
       }
 
-      // 5. Initialize Resumable Upload
+      // 6. Initialize Resumable Upload
       if (url.pathname === '/api/uploads/initialize' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
         const body = (await request.json()) as any;
@@ -203,7 +217,7 @@ export default {
         return Response.json({ uploadUri, uploadId }, { headers });
       }
 
-      // 6. Attach to Playlist
+      // 7. Attach to Playlist
       if (url.pathname === '/api/playlists/attach' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
         const body = (await request.json()) as any;
