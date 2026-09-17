@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
 const API_BASE = 'http://localhost:8787';
-const QUEUE_STORAGE_KEY = 'yt_upload_queue_v2';
+const QUEUE_STORAGE_KEY = 'yt_upload_queue_v3';
 
 interface UserProfile {
   id: string;
@@ -30,6 +30,7 @@ interface VideoFileItem {
   speedMBps: number;
   uploadUri?: string;
   videoId?: string;
+  errorMessage?: string;
   uploader?: ResumableChunkUploader;
 }
 
@@ -42,13 +43,12 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [isDragging, setIsDragging] = useState<boolean>(false);
 
-  // Global settings including the mandatory Made for Kids COPPA question
   const [globalConfig, setGlobalConfig] = useState({
     privacy: 'unlisted',
     description: '',
     tags: 'bulk, upload',
     categoryId: '27',
-    isMadeForKids: false, // Default: Not made for kids (standard YouTube requirement)
+    isMadeForKids: false,
   });
 
   const [videos, setVideos] = useState<VideoFileItem[]>(() => {
@@ -58,7 +58,6 @@ export default function App() {
         const parsed: VideoFileItem[] = JSON.parse(saved);
         return parsed.map((v) => ({
           ...v,
-          // If interrupted mid-upload, set back to QUEUED (never stuck on failed)
           status: v.status === 'UPLOADING' ? 'QUEUED' : v.status,
           uploader: undefined,
           file: undefined,
@@ -73,13 +72,13 @@ export default function App() {
   const videosRef = useRef<VideoFileItem[]>([]);
   videosRef.current = videos;
 
-  // Warn user before closing/reloading if an upload is active
+  // Warn user before reload/navigation during uploads
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       const isUploading = videosRef.current.some((v) => v.status === 'UPLOADING');
       if (isUploading) {
         e.preventDefault();
-        e.returnValue = 'Videos are currently uploading. Reloading will pause them.';
+        e.returnValue = 'Videos are currently uploading. Reloading will pause progress.';
         return e.returnValue;
       }
     };
@@ -87,7 +86,7 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
-  // Persist queue metadata & session URIs to localStorage
+  // Save metadata & active session URIs across reloads
   useEffect(() => {
     try {
       const serialized = videos.map(({ uploader, file, previewUrl, ...rest }) => ({
@@ -181,7 +180,6 @@ export default function App() {
     Array.from(fileList)
       .filter((f) => f.type.startsWith('video/'))
       .forEach((f) => {
-        // Match existing queue item by filename and size to re-link after a reload
         const existingIndex = videosRef.current.findIndex(
           (v) => v.fileName === f.name && Math.abs(v.fileSize - f.size) < 1000
         );
@@ -190,7 +188,8 @@ export default function App() {
           updateVideo(videosRef.current[existingIndex].id, {
             file: f,
             previewUrl: URL.createObjectURL(f),
-            status: videosRef.current[existingIndex].status === 'FAILED' ? 'QUEUED' : videosRef.current[existingIndex].status,
+            status: 'QUEUED',
+            errorMessage: undefined,
           });
         } else {
           incoming.push({
@@ -216,7 +215,6 @@ export default function App() {
     }
   };
 
-  // Re-attach an individual file if user refreshed mid-upload
   const handleSingleFileReselect = (id: string, file: File) => {
     updateVideo(id, {
       file,
@@ -224,6 +222,7 @@ export default function App() {
       fileSize: file.size,
       previewUrl: URL.createObjectURL(file),
       status: 'QUEUED',
+      errorMessage: undefined,
     });
   };
 
@@ -238,16 +237,19 @@ export default function App() {
   const uploadSingleVideo = async (item: VideoFileItem) => {
     if (!profile) return;
     if (!item.file) {
-      alert(`Please click "Select File" on "${item.title}" to reattach it before uploading.`);
+      updateVideo(item.id, {
+        status: 'FAILED',
+        errorMessage: 'File detached. Click Reselect to continue.',
+      });
       return;
     }
 
-    updateVideo(item.id, { status: 'UPLOADING' });
+    updateVideo(item.id, { status: 'UPLOADING', errorMessage: undefined });
 
     try {
       let uploadUri = item.uploadUri;
 
-      // Only initialize a new session if one doesn't exist
+      // 1. Get resumable session URI only if not already initiated
       if (!uploadUri) {
         const initRes = await fetch(`${API_BASE}/api/uploads/initialize`, {
           method: 'POST',
@@ -266,12 +268,14 @@ export default function App() {
         });
 
         const data = await initRes.json();
-        if (!data.uploadUri) throw new Error(data.error || 'Could not get upload URI');
+        if (!data.uploadUri) {
+          throw new Error(data.error || 'Could not acquire upload session from Google');
+        }
         uploadUri = data.uploadUri;
         updateVideo(item.id, { uploadUri });
       }
 
-      // Stream Chunks (auto-resumes from remote offset if existing session)
+      // 2. Stream chunked bytes to YouTube directly
       const uploader = new ResumableChunkUploader(item.file, uploadUri!, (progress) => {
         updateVideo(item.id, {
           progress: progress.percentage,
@@ -282,18 +286,32 @@ export default function App() {
       updateVideo(item.id, { uploader });
       const { videoId } = await uploader.start();
 
-      if (selectedPlaylist) {
-        await fetch(`${API_BASE}/api/playlists/attach`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
-          body: JSON.stringify({ playlistId: selectedPlaylist, videoId }),
-        });
-      }
+      // Video byte upload is 100% complete
+      updateVideo(item.id, {
+        status: 'COMPLETED',
+        progress: 100,
+        videoId,
+        errorMessage: undefined,
+      });
 
-      updateVideo(item.id, { status: 'COMPLETED', progress: 100, videoId });
-    } catch (err) {
-      console.error(err);
-      updateVideo(item.id, { status: 'FAILED' });
+      // 3. Attach to playlist independently (non-fatal if playlist insertion errors)
+      if (selectedPlaylist && videoId) {
+        try {
+          await fetch(`${API_BASE}/api/playlists/attach`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
+            body: JSON.stringify({ playlistId: selectedPlaylist, videoId }),
+          });
+        } catch (playlistErr) {
+          console.warn('Playlist attachment error (video was uploaded successfully):', playlistErr);
+        }
+      }
+    } catch (err: any) {
+      console.error(`Upload error for "${item.title}":`, err);
+      updateVideo(item.id, {
+        status: 'FAILED',
+        errorMessage: err.message || 'Transmission error',
+      });
     }
   };
 
@@ -301,10 +319,12 @@ export default function App() {
     if (!profile) return;
     if (isProcessing) return;
 
-    // Check for missing file attachments first
-    const unattached = videosRef.current.filter((v) => (v.status === 'QUEUED' || v.status === 'FAILED') && !v.file);
+    // Verify all pending uploads have their file attached
+    const unattached = videosRef.current.filter(
+      (v) => (v.status === 'QUEUED' || v.status === 'FAILED') && !v.file
+    );
     if (unattached.length > 0) {
-      alert(`Please click "Select File" to re-attach the video file(s) for the restored items.`);
+      alert('Please click "Reselect File" on items marked red before starting the upload.');
       return;
     }
 
@@ -319,7 +339,10 @@ export default function App() {
       }
     };
 
-    const workers = Array.from({ length: Math.min(concurrencyLimit, eligible.length) }, () => worker());
+    const workers = Array.from(
+      { length: Math.min(concurrencyLimit, eligible.length) },
+      () => worker()
+    );
     await Promise.all(workers);
     setIsProcessing(false);
   };
@@ -412,7 +435,11 @@ export default function App() {
           { label: 'Total in Queue', val: videos.length, color: '#3b82f6' },
           { label: 'Active Uploading', val: uploadingCount, color: '#f59e0b' },
           { label: 'Completed', val: completedCount, color: '#10b981' },
-          { label: 'Failed / Paused', val: videos.filter((v) => v.status === 'FAILED').length, color: '#ef4444' },
+          {
+            label: 'Failed / Needs Action',
+            val: videos.filter((v) => v.status === 'FAILED').length,
+            color: '#ef4444',
+          },
         ].map((item, idx) => (
           <div
             key={idx}
@@ -483,7 +510,6 @@ export default function App() {
               <option value="1">1 Stream (Sequential)</option>
               <option value="2">2 Concurrent Streams</option>
               <option value="3">3 Concurrent Streams</option>
-              <option value="4">4 Concurrent Streams</option>
             </select>
           </div>
 
@@ -513,7 +539,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Mandatory YouTube Audience Setting (COPPA) */}
+        {/* Mandatory COPPA Audience Question */}
         <div
           style={{
             padding: '12px 14px',
@@ -527,7 +553,7 @@ export default function App() {
             Audience: Is this content made for kids? (Mandatory YouTube Requirement)
           </div>
           <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10 }}>
-            Regardless of location, you are legally required to comply with COPPA.
+            Required by YouTube to comply with COPPA regulations.
           </div>
           <div style={{ display: 'flex', gap: 20, fontSize: 13 }}>
             <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
@@ -554,7 +580,7 @@ export default function App() {
         {/* Quick Playlist Creation */}
         <div className="playlist-action-row">
           <input
-            placeholder="Quick create playlist and select..."
+            placeholder="Quick create playlist..."
             value={newPlaylistTitle}
             onChange={(e) => setNewPlaylistTitle(e.target.value)}
             style={{
@@ -584,7 +610,7 @@ export default function App() {
         </div>
       </section>
 
-      {/* Drag & Drop Target */}
+      {/* Drag & Drop File Picker */}
       <div
         onDragOver={(e) => {
           e.preventDefault();
@@ -639,7 +665,7 @@ export default function App() {
               <div>
                 <h2 style={{ fontSize: 16, fontWeight: 600 }}>Upload Queue</h2>
                 <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                  {uploadingCount} transmitting | {completedCount} finished
+                  {uploadingCount} transmitting | {completedCount} completed
                 </p>
               </div>
 
@@ -677,7 +703,7 @@ export default function App() {
                 boxShadow: isProcessing ? 'none' : '0 4px 14px rgba(239, 68, 68, 0.4)',
               }}
             >
-              {isProcessing ? 'Transmitting In Parallel...' : 'Start Parallel Upload'}
+              {isProcessing ? 'Transmitting Videos In Parallel...' : 'Start Parallel Upload'}
             </button>
           </div>
 
@@ -706,19 +732,19 @@ export default function App() {
                         height: 65,
                         borderRadius: 8,
                         background: '#1f293d',
-                        border: '1px dashed #3b82f6',
+                        border: '1px dashed #ef4444',
                         display: 'flex',
                         flexDirection: 'column',
                         alignItems: 'center',
                         justifyContent: 'center',
                         fontSize: 11,
-                        color: '#60a5fa',
+                        color: '#f87171',
                         cursor: 'pointer',
                         padding: 4,
                         textAlign: 'center',
                       }}
                     >
-                      <span>📎 Select File</span>
+                      <span>📎 Reselect</span>
                       <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to resume</span>
                       <input
                         type="file"
@@ -769,6 +795,7 @@ export default function App() {
                         }}
                       >
                         {item.status} {item.speedMBps > 0 && `• ${item.speedMBps} MB/s`}
+                        {item.errorMessage && ` (${item.errorMessage})`}
                       </span>
 
                       {item.videoId && (
@@ -778,7 +805,7 @@ export default function App() {
                           rel="noreferrer"
                           style={{ color: '#ef4444', textDecoration: 'none', fontWeight: 600 }}
                         >
-                          View Video ↗
+                          View on YouTube ↗
                         </a>
                       )}
                     </div>
@@ -800,21 +827,38 @@ export default function App() {
                     </div>
                   </div>
 
-                  <button
-                    onClick={() => setVideos((vs) => vs.filter((v) => v.id !== item.id))}
-                    disabled={item.status === 'UPLOADING'}
-                    style={{
-                      alignSelf: 'flex-end',
-                      background: 'transparent',
-                      border: 'none',
-                      color: '#64748b',
-                      fontSize: 18,
-                      cursor: item.status === 'UPLOADING' ? 'not-allowed' : 'pointer',
-                      padding: 4,
-                    }}
-                  >
-                    ✕
-                  </button>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    {item.status === 'FAILED' && item.file && (
+                      <button
+                        onClick={() => uploadSingleVideo(item)}
+                        style={{
+                          padding: '4px 8px',
+                          borderRadius: 6,
+                          background: '#ef4444',
+                          color: '#fff',
+                          border: 'none',
+                          fontSize: 11,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Retry
+                      </button>
+                    )}
+                    <button
+                      onClick={() => setVideos((vs) => vs.filter((v) => v.id !== item.id))}
+                      disabled={item.status === 'UPLOADING'}
+                      style={{
+                        background: 'transparent',
+                        border: 'none',
+                        color: '#64748b',
+                        fontSize: 18,
+                        cursor: item.status === 'UPLOADING' ? 'not-allowed' : 'pointer',
+                        padding: 4,
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </div>
                 </div>
               );
             })}
