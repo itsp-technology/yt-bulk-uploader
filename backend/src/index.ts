@@ -21,8 +21,8 @@ export default {
       // 1. Google OAuth URL generator
       if (url.pathname === '/api/auth/url' && request.method === 'GET') {
         const scopes = [
-          'https://www.googleapis.com/auth/youtube.upload',
           'https://www.googleapis.com/auth/youtube',
+          'https://www.googleapis.com/auth/youtube.upload',
           'https://www.googleapis.com/auth/userinfo.profile',
           'https://www.googleapis.com/auth/userinfo.email',
         ].join(' ');
@@ -68,7 +68,7 @@ export default {
         const profile = (await userProfileRes.json()) as any;
 
         const channelRes = await fetch(
-          'https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true',
+          'https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails&mine=true',
           { headers: { Authorization: `Bearer ${tokens.access_token}` } }
         );
         const channelData = (await channelRes.json()) as any;
@@ -106,13 +106,13 @@ export default {
         return Response.redirect(`${env.FRONTEND_URL}/?userId=${finalUser?.id}`, 302);
       }
 
-      // Check authorization header
+      // Authorization header validation
       const userId = request.headers.get('x-user-id');
       if (!userId) {
         return Response.json({ error: 'Unauthorized: Missing x-user-id' }, { status: 401, headers });
       }
 
-      // 3. User Profile & YouTube Details
+      // 3. User Profile
       if (url.pathname === '/api/me' && request.method === 'GET') {
         const user = await env.DB.prepare(
           'SELECT id, email, name, avatar, channel_id, channel_title FROM users WHERE id = ?'
@@ -130,7 +130,7 @@ export default {
       if (url.pathname === '/api/playlists' && request.method === 'GET') {
         const { token } = await getValidAccessToken(env, userId);
         const res = await fetch(
-          'https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true&maxResults=50',
+          'https://www.googleapis.com/youtube/v3/playlists?part=snippet,contentDetails&mine=true&maxResults=50',
           { headers: { Authorization: `Bearer ${token}` } }
         );
         const data = (await res.json()) as any;
@@ -149,7 +149,7 @@ export default {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            snippet: { title: body.title, description: body.description },
+            snippet: { title: body.title, description: body.description || '' },
             status: { privacyStatus: body.privacy || 'unlisted' },
           }),
         });
@@ -157,10 +157,32 @@ export default {
         return Response.json(data, { headers });
       }
 
-      // 6. Initialize Resumable Upload (with COPPA Made for Kids)
+      // 6. Initialize Resumable Upload
       if (url.pathname === '/api/uploads/initialize' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
         const body = (await request.json()) as any;
+
+        const mimeType = body.mimeType && body.mimeType.length > 0 ? body.mimeType : 'video/mp4';
+        const sanitizedTags = Array.isArray(body.tags)
+          ? body.tags.filter((t: string) => t && t.trim().length > 0)
+          : (body.tags || '')
+              .split(',')
+              .map((t: string) => t.trim())
+              .filter((t: string) => t.length > 0);
+
+        const metadataPayload = {
+          snippet: {
+            title: body.title || 'Untitled Video',
+            description: body.description || '',
+            tags: sanitizedTags.length > 0 ? sanitizedTags : ['video'],
+            categoryId: body.categoryId || '27',
+          },
+          status: {
+            privacyStatus: body.privacyStatus || 'unlisted',
+            selfDeclaredMadeForKids: Boolean(body.isMadeForKids),
+            embeddable: true,
+          },
+        };
 
         const initialRes = await fetch(
           'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
@@ -169,33 +191,28 @@ export default {
             headers: {
               Authorization: `Bearer ${token}`,
               'Content-Type': 'application/json; charset=UTF-8',
-              'X-Upload-Content-Type': body.mimeType || 'video/*',
-              'X-Upload-Content-Length': body.fileSize.toString(),
+              'X-Upload-Content-Type': mimeType,
+              'X-Upload-Content-Length': String(body.fileSize),
             },
-            body: JSON.stringify({
-              snippet: {
-                title: body.title,
-                description: body.description || '',
-                tags: Array.isArray(body.tags)
-                  ? body.tags
-                  : body.tags?.split(',').map((t: string) => t.trim()),
-                categoryId: body.categoryId || '27',
-              },
-              status: {
-                privacyStatus: body.privacyStatus || 'unlisted',
-                selfDeclaredMadeForKids: Boolean(body.isMadeForKids), // Mandatory COPPA setting
-                embeddable: true,
-              },
-            }),
+            body: JSON.stringify(metadataPayload),
           }
         );
 
         const uploadUri = initialRes.headers.get('Location');
         if (!uploadUri) {
-          const errData = await initialRes.text();
+          const errText = await initialRes.text();
+          let parsedError = errText;
+          try {
+            const errJson = JSON.parse(errText);
+            parsedError = errJson?.error?.message || errText;
+          } catch {}
+
           return Response.json(
-            { error: 'Failed to obtain resumable URI', details: errData },
-            { status: 500, headers }
+            {
+              error: `Google API Error (${initialRes.status}): ${parsedError}`,
+              rawDetails: parsedError,
+            },
+            { status: initialRes.status, headers }
           );
         }
 
@@ -209,7 +226,7 @@ export default {
           body.title,
           body.description || null,
           body.privacyStatus || 'unlisted',
-          JSON.stringify(body.tags || []),
+          JSON.stringify(sanitizedTags),
           body.fileSize,
           uploadUri,
           body.playlistId || null
@@ -218,27 +235,146 @@ export default {
         return Response.json({ uploadUri, uploadId }, { headers });
       }
 
-      // 7. Attach to Playlist
+      // 7. Attach Video to Playlist
       if (url.pathname === '/api/playlists/attach' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
-        const body = (await request.json()) as any;
+        const { playlistId, videoId } = (await request.json()) as any;
 
-        const res = await fetch('https://www.googleapis.com/youtube/v3/playlistItems?part=snippet', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            snippet: {
-              playlistId: body.playlistId,
-              resourceId: { kind: 'youtube#video', videoId: body.videoId },
+        if (!playlistId || !videoId) {
+          return Response.json({ error: 'Missing playlistId or videoId' }, { status: 400, headers });
+        }
+
+        let attempts = 0;
+        let lastError = '';
+
+        while (attempts < 6) {
+          attempts++;
+
+          const res = await fetch('https://www.googleapis.com/youtube/v3/playlistItems?part=snippet', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
             },
-          }),
-        });
+            body: JSON.stringify({
+              snippet: {
+                playlistId: playlistId,
+                resourceId: {
+                  kind: 'youtube#video',
+                  videoId: videoId,
+                },
+              },
+            }),
+          });
 
+          if (res.ok) {
+            const data = await res.json();
+            return Response.json({ success: true, item: data }, { headers });
+          }
+
+          const errText = await res.text();
+          lastError = errText;
+
+          if (errText.includes('videoAlreadyInPlaylist')) {
+            return Response.json({ success: true, alreadyInPlaylist: true }, { headers });
+          }
+
+          if (res.status === 401 || res.status === 403) {
+            return Response.json(
+              {
+                error: 'Permission Denied: Please Disconnect and Reconnect YouTube account to grant Playlist permissions.',
+                details: errText,
+              },
+              { status: 403, headers }
+            );
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, attempts * 1500));
+        }
+
+        return Response.json(
+          { error: `Google rejected playlist linking: ${lastError}`, details: lastError },
+          { status: 500, headers }
+        );
+      }
+
+      // 8. Instant Channel Uploads Lookup (Accurate & avoids search index lag)
+      if (url.pathname === '/api/uploads/recent-channel-videos' && request.method === 'GET') {
+        const { token, user } = await getValidAccessToken(env, userId);
+
+        let uploadsPlaylistId = '';
+        if (user.channel_id && user.channel_id.startsWith('UC')) {
+          uploadsPlaylistId = 'UU' + user.channel_id.substring(2);
+        } else {
+          const chRes = await fetch(
+            'https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true',
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          const chData = (await chRes.json()) as any;
+          uploadsPlaylistId = chData.items?.[0]?.contentDetails?.relatedPlaylists?.uploads || '';
+        }
+
+        if (!uploadsPlaylistId) {
+          return Response.json({ items: [] }, { headers });
+        }
+
+        // Query the channel's actual uploads playlist directly
+        const plRes = await fetch(
+          `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${uploadsPlaylistId}&maxResults=15`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const plData = (await plRes.json()) as any;
+        const items = (plData.items || []).map((it: any) => ({
+          title: it.snippet?.title,
+          videoId: it.snippet?.resourceId?.videoId,
+        }));
+
+        return Response.json({ items }, { headers });
+      }
+
+      // 9. Processing status
+      if (url.pathname === '/api/uploads/status' && request.method === 'GET') {
+        const videoId = url.searchParams.get('videoId');
+        if (!videoId) {
+          return Response.json({ error: 'Missing videoId' }, { status: 400, headers });
+        }
+
+        const { token } = await getValidAccessToken(env, userId);
+        const res = await fetch(
+          `https://www.googleapis.com/youtube/v3/videos?part=processingDetails,status&id=${videoId}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
         const data = (await res.json()) as any;
-        return Response.json(data, { headers });
+        const item = data.items?.[0];
+
+        if (!item) {
+          return Response.json({ status: 'uploaded', partsProcessed: 100, processingProgress: 100 }, { headers });
+        }
+
+        const processingDetails = item.processingDetails || {};
+        const statusDetails = item.status || {};
+
+        const processingStatus = processingDetails.processingStatus || 'processing';
+        const partsProcessed = processingDetails.processingProgress?.partsProcessed;
+        const partsTotal = processingDetails.processingProgress?.partsTotal;
+        const timeLeftMs = processingDetails.processingProgress?.timeLeftMs;
+
+        let percentage = 0;
+        if (partsTotal && partsTotal > 0) {
+          percentage = Math.round((Number(partsProcessed) / Number(partsTotal)) * 100);
+        } else if (processingStatus === 'succeeded' || statusDetails.uploadStatus === 'processed') {
+          percentage = 100;
+        }
+
+        return Response.json(
+          {
+            processingStatus,
+            uploadStatus: statusDetails.uploadStatus,
+            percentage,
+            timeLeftMs,
+          },
+          { headers }
+        );
       }
 
       return new Response('Not Found', { status: 404, headers });

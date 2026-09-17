@@ -3,7 +3,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
 const API_BASE = 'http://localhost:8787';
-const QUEUE_STORAGE_KEY = 'yt_upload_queue_v4';
+const QUEUE_STORAGE_KEY = 'yt_upload_queue_v16';
+const SAVED_PLAYLIST_KEY = 'yt_selected_playlist_v16';
 
 interface UserProfile {
   id: string;
@@ -25,19 +26,25 @@ interface VideoFileItem {
   tags: string;
   privacyStatus: string;
   isMadeForKids: boolean;
-  status: 'QUEUED' | 'UPLOADING' | 'COMPLETED' | 'FAILED' | 'PAUSED';
+  playlistId: string;
+  playlistTitle?: string;
+  status: 'QUEUED' | 'UPLOADING' | 'PROCESSING' | 'COMPLETED' | 'FAILED' | 'PAUSED';
   progress: number;
   speedMBps: number;
+  processingProgress?: number;
   uploadUri?: string;
   videoId?: string;
   errorMessage?: string;
+  playlistAttached?: boolean;
+  isAttachingPlaylist?: boolean;
+  playlistError?: string;
   uploader?: ResumableChunkUploader;
 }
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [playlists, setPlaylists] = useState<any[]>([]);
-  const [selectedPlaylist, setSelectedPlaylist] = useState('');
+  const [selectedPlaylist, setSelectedPlaylist] = useState<string>('');
   const [newPlaylistTitle, setNewPlaylistTitle] = useState('');
   const [concurrencyLimit, setConcurrencyLimit] = useState<number>(2);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
@@ -51,33 +58,47 @@ export default function App() {
     isMadeForKids: false,
   });
 
-  const [videos, setVideos] = useState<VideoFileItem[]>(() => {
-    try {
-      const saved = localStorage.getItem(QUEUE_STORAGE_KEY);
-      if (saved) {
-        const parsed: VideoFileItem[] = JSON.parse(saved);
-        return parsed.map((v) => ({
-          ...v,
-          status: v.status === 'UPLOADING' ? 'QUEUED' : v.status,
-          uploader: undefined,
-          file: undefined,
-        }));
-      }
-    } catch (e) {
-      console.error('Failed to parse queue storage', e);
-    }
-    return [];
-  });
+  const [videos, setVideos] = useState<VideoFileItem[]>([]);
 
   const videosRef = useRef<VideoFileItem[]>([]);
   videosRef.current = videos;
 
   useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    try {
+      const savedPlaylist = localStorage.getItem(SAVED_PLAYLIST_KEY);
+      if (savedPlaylist) {
+        setSelectedPlaylist(savedPlaylist);
+      }
+
+      const savedQueue = localStorage.getItem(QUEUE_STORAGE_KEY);
+      if (savedQueue) {
+        const parsed: VideoFileItem[] = JSON.parse(savedQueue);
+        setVideos(
+          parsed.map((v) => ({
+            ...v,
+            status: v.status === 'UPLOADING' ? 'QUEUED' : v.status,
+            uploader: undefined,
+            file: undefined,
+          }))
+        );
+      }
+    } catch (e) {
+      console.error('Failed to load queue storage', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      const isUploading = videosRef.current.some((v) => v.status === 'UPLOADING');
-      if (isUploading) {
+      const isWorking = videosRef.current.some(
+        (v) => v.status === 'UPLOADING' || v.status === 'PROCESSING'
+      );
+      if (isWorking) {
         e.preventDefault();
-        e.returnValue = 'Videos are currently uploading. Reloading will interrupt progress.';
+        e.returnValue = 'Videos are currently uploading or processing.';
         return e.returnValue;
       }
     };
@@ -86,10 +107,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (typeof window === 'undefined') return;
+
     try {
       const serialized = videos.map(({ uploader, file, previewUrl, ...rest }) => ({
         ...rest,
-        previewUrl: previewUrl.startsWith('blob:') ? '' : previewUrl,
+        previewUrl: previewUrl?.startsWith('blob:') ? '' : previewUrl || '',
       }));
       localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(serialized));
     } catch (e) {
@@ -98,6 +121,8 @@ export default function App() {
   }, [videos]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') return;
+
     const params = new URLSearchParams(window.location.search);
     const idFromUrl = params.get('userId');
     const storedId = localStorage.getItem('yt_user_id');
@@ -130,8 +155,11 @@ export default function App() {
   };
 
   const logout = () => {
-    localStorage.removeItem('yt_user_id');
-    localStorage.removeItem(QUEUE_STORAGE_KEY);
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('yt_user_id');
+      localStorage.removeItem(QUEUE_STORAGE_KEY);
+      localStorage.removeItem(SAVED_PLAYLIST_KEY);
+    }
     setProfile(null);
     setVideos([]);
   };
@@ -139,7 +167,9 @@ export default function App() {
   const loginGoogle = async () => {
     const res = await fetch(`${API_BASE}/api/auth/url`);
     const { url } = await res.json();
-    window.location.href = url;
+    if (typeof window !== 'undefined') {
+      window.location.href = url;
+    }
   };
 
   const loadPlaylists = async (uid: string) => {
@@ -156,17 +186,56 @@ export default function App() {
     }
   };
 
+  const handlePlaylistChange = (playlistId: string) => {
+    setSelectedPlaylist(playlistId);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(SAVED_PLAYLIST_KEY, playlistId);
+    }
+    const found = playlists.find((p) => p.id === playlistId);
+    const title = found?.snippet?.title || '';
+
+    setVideos((items) =>
+      items.map((item) =>
+        item.status === 'QUEUED' || item.status === 'FAILED'
+          ? { ...item, playlistId, playlistTitle: title, playlistAttached: false }
+          : item
+      )
+    );
+  };
+
+  const handleAudienceChange = (isMadeForKids: boolean) => {
+    setGlobalConfig((prev) => ({ ...prev, isMadeForKids }));
+    setVideos((items) =>
+      items.map((item) =>
+        item.status === 'QUEUED' || item.status === 'FAILED'
+          ? { ...item, isMadeForKids }
+          : item
+      )
+    );
+  };
+
+  const handlePrivacyChange = (privacyStatus: string) => {
+    setGlobalConfig((prev) => ({ ...prev, privacy: privacyStatus }));
+    setVideos((items) =>
+      items.map((item) =>
+        item.status === 'QUEUED' || item.status === 'FAILED'
+          ? { ...item, privacyStatus }
+          : item
+      )
+    );
+  };
+
   const createPlaylist = async () => {
     if (!profile || !newPlaylistTitle.trim()) return;
     const res = await fetch(`${API_BASE}/api/playlists`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
-      body: JSON.stringify({ title: newPlaylistTitle, privacy: 'unlisted' }),
+      body: JSON.stringify({ title: newPlaylistTitle.trim(), privacy: 'unlisted' }),
     });
     if (res.ok) {
       const created = await res.json();
       setPlaylists((p) => [...p, created]);
-      setSelectedPlaylist(created.id);
+      handlePlaylistChange(created.id);
       setNewPlaylistTitle('');
     }
   };
@@ -174,9 +243,10 @@ export default function App() {
   const handleFiles = (fileList: FileList | null) => {
     if (!fileList) return;
     const incoming: VideoFileItem[] = [];
+    const currentPlaylist = playlists.find((p) => p.id === selectedPlaylist);
 
     Array.from(fileList)
-      .filter((f) => f.type.startsWith('video/'))
+      .filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(f.name))
       .forEach((f) => {
         const existingIndex = videosRef.current.findIndex(
           (v) => v.fileName === f.name && Math.abs(v.fileSize - f.size) < 1000
@@ -185,9 +255,11 @@ export default function App() {
         if (existingIndex !== -1) {
           updateVideo(videosRef.current[existingIndex].id, {
             file: f,
-            previewUrl: URL.createObjectURL(f),
+            previewUrl: typeof window !== 'undefined' ? URL.createObjectURL(f) : '',
             status: 'QUEUED',
             errorMessage: undefined,
+            playlistId: selectedPlaylist,
+            playlistTitle: currentPlaylist?.snippet?.title,
           });
         } else {
           incoming.push({
@@ -195,12 +267,14 @@ export default function App() {
             file: f,
             fileName: f.name,
             fileSize: f.size,
-            previewUrl: URL.createObjectURL(f),
+            previewUrl: typeof window !== 'undefined' ? URL.createObjectURL(f) : '',
             title: f.name.replace(/\.[^/.]+$/, ''),
             description: globalConfig.description,
             tags: globalConfig.tags,
             privacyStatus: globalConfig.privacy,
             isMadeForKids: globalConfig.isMadeForKids,
+            playlistId: selectedPlaylist,
+            playlistTitle: currentPlaylist?.snippet?.title,
             status: 'QUEUED',
             progress: 0,
             speedMBps: 0,
@@ -218,7 +292,7 @@ export default function App() {
       file,
       fileName: file.name,
       fileSize: file.size,
-      previewUrl: URL.createObjectURL(file),
+      previewUrl: typeof window !== 'undefined' ? URL.createObjectURL(file) : '',
       status: 'QUEUED',
       errorMessage: undefined,
     });
@@ -232,6 +306,162 @@ export default function App() {
     setVideos((items) => items.filter((v) => v.status !== 'COMPLETED'));
   };
 
+  // Instant ID recovery: Checks channel's uploads directly
+  const autoRecoverVideoId = async (item: VideoFileItem): Promise<string | null> => {
+    if (item.videoId && item.videoId.trim().length > 0) return item.videoId.trim();
+    if (!profile) return null;
+
+    try {
+      const res = await fetch(`${API_BASE}/api/uploads/recent-channel-videos`, {
+        headers: { 'x-user-id': profile.id },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const found = (data.items || []).find((v: any) => v.title === item.title);
+        if (found && found.videoId) {
+          updateVideo(item.id, { videoId: found.videoId });
+          return found.videoId;
+        }
+      }
+    } catch {}
+    return null;
+  };
+
+  // Direct Playlist Attachment Action
+  const attachVideoToPlaylist = async (
+    itemId: string,
+    targetPlaylistId?: string,
+    explicitVideoId?: string
+  ): Promise<boolean> => {
+    if (!profile) return false;
+
+    const item = videosRef.current.find((v) => v.id === itemId);
+    if (!item) return false;
+
+    const playlistId = targetPlaylistId || item.playlistId || selectedPlaylist;
+    if (!playlistId) {
+      if (typeof window !== 'undefined') {
+        alert('Please choose a playlist from the dropdown.');
+      }
+      return false;
+    }
+
+    updateVideo(itemId, { isAttachingPlaylist: true, playlistError: undefined });
+
+    const activeVideoId = explicitVideoId || (await autoRecoverVideoId(item));
+    if (!activeVideoId) {
+      updateVideo(itemId, {
+        isAttachingPlaylist: false,
+        playlistError: 'Could not detect YouTube Video ID. Enter it manually or wait a few seconds.',
+      });
+      return false;
+    }
+
+    try {
+      const attachRes = await fetch(`${API_BASE}/api/playlists/attach`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
+        body: JSON.stringify({ playlistId, videoId: activeVideoId }),
+      });
+
+      const resData = await attachRes.json().catch(() => ({}));
+
+      if (attachRes.ok && (resData.success || resData.alreadyInPlaylist)) {
+        const found = playlists.find((p) => p.id === playlistId);
+        updateVideo(itemId, {
+          playlistAttached: true,
+          isAttachingPlaylist: false,
+          playlistId,
+          videoId: activeVideoId,
+          playlistTitle: found?.snippet?.title || item.playlistTitle || 'Target Playlist',
+          playlistError: undefined,
+        });
+        return true;
+      } else {
+        const err = resData.error || 'Failed to attach video to playlist';
+        updateVideo(itemId, {
+          playlistAttached: false,
+          isAttachingPlaylist: false,
+          playlistError: err,
+        });
+        return false;
+      }
+    } catch (err: any) {
+      updateVideo(itemId, {
+        playlistAttached: false,
+        isAttachingPlaylist: false,
+        playlistError: err.message,
+      });
+      return false;
+    }
+  };
+
+  // Background Processing poller
+  const runBackgroundProcessingAndAttach = async (itemId: string, videoId: string, targetPlaylistId?: string) => {
+    if (!profile) return;
+
+    let isDone = false;
+    let attempts = 0;
+    let attached = false;
+
+    while (!isDone && attempts < 35) {
+      await new Promise((r) => setTimeout(r, 3000));
+      attempts++;
+
+      try {
+        const res = await fetch(`${API_BASE}/api/uploads/status?videoId=${videoId}`, {
+          headers: { 'x-user-id': profile.id },
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+
+          if (targetPlaylistId && !attached && attempts >= 2) {
+            attached = await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
+          }
+
+          if (data.processingStatus === 'succeeded' || data.uploadStatus === 'processed') {
+            isDone = true;
+
+            if (targetPlaylistId && !attached) {
+              await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
+            }
+
+            updateVideo(itemId, {
+              status: 'COMPLETED',
+              progress: 100,
+              processingProgress: 100,
+            });
+            return;
+          }
+
+          if (data.processingStatus === 'failed' || data.uploadStatus === 'rejected') {
+            isDone = true;
+            updateVideo(itemId, {
+              status: 'FAILED',
+              errorMessage: 'YouTube processing was rejected by Google',
+            });
+            return;
+          }
+
+          const realPercentage = data.percentage > 0 ? data.percentage : Math.min(25 + attempts * 3, 95);
+          updateVideo(itemId, {
+            status: 'PROCESSING',
+            processingProgress: realPercentage,
+          });
+        }
+      } catch (err) {
+        console.warn('Processing status poll error:', err);
+      }
+    }
+
+    if (targetPlaylistId && !attached) {
+      await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
+    }
+
+    updateVideo(itemId, { status: 'COMPLETED', progress: 100, processingProgress: 100 });
+  };
+
   const uploadSingleVideo = async (item: VideoFileItem) => {
     if (!profile) return;
     if (!item.file) {
@@ -242,12 +472,22 @@ export default function App() {
       return;
     }
 
-    updateVideo(item.id, { status: 'UPLOADING', errorMessage: undefined });
+    const effectivePlaylistId = item.playlistId || selectedPlaylist;
+    const currentPlaylist = playlists.find((p) => p.id === effectivePlaylistId);
+
+    updateVideo(item.id, {
+      status: 'UPLOADING',
+      errorMessage: undefined,
+      playlistId: effectivePlaylistId,
+      playlistTitle: currentPlaylist?.snippet?.title || item.playlistTitle,
+    });
 
     try {
       let uploadUri = item.uploadUri;
 
       if (!uploadUri) {
+        const safeMimeType = item.file.type && item.file.type.length > 0 ? item.file.type : 'video/mp4';
+
         const initRes = await fetch(`${API_BASE}/api/uploads/initialize`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
@@ -259,15 +499,17 @@ export default function App() {
             isMadeForKids: item.isMadeForKids,
             categoryId: globalConfig.categoryId,
             fileSize: item.file.size,
-            mimeType: item.file.type,
-            playlistId: selectedPlaylist || undefined,
+            mimeType: safeMimeType,
+            playlistId: effectivePlaylistId || undefined,
           }),
         });
 
         const data = await initRes.json();
-        if (!data.uploadUri) {
-          throw new Error(data.error || 'Failed to acquire upload session');
+        if (!initRes.ok || !data.uploadUri) {
+          const detailMessage = data.error || data.rawDetails || 'Failed to initialize session';
+          throw new Error(detailMessage);
         }
+
         uploadUri = data.uploadUri;
         updateVideo(item.id, { uploadUri });
       }
@@ -282,31 +524,31 @@ export default function App() {
       updateVideo(item.id, { uploader });
       const { videoId } = await uploader.start();
 
-      // Confirmed Completed
+      const finalVideoId = videoId || item.videoId;
       updateVideo(item.id, {
-        status: 'COMPLETED',
+        status: 'PROCESSING',
         progress: 100,
-        videoId: videoId || item.videoId,
+        videoId: finalVideoId,
         errorMessage: undefined,
       });
 
-      // Playlist addition (non-blocking)
-      if (selectedPlaylist && videoId) {
-        try {
-          await fetch(`${API_BASE}/api/playlists/attach`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
-            body: JSON.stringify({ playlistId: selectedPlaylist, videoId }),
-          });
-        } catch (plErr) {
-          console.warn('Playlist addition notice:', plErr);
-        }
+      if (finalVideoId) {
+        runBackgroundProcessingAndAttach(item.id, finalVideoId, effectivePlaylistId);
+      } else {
+        updateVideo(item.id, { status: 'COMPLETED', progress: 100 });
       }
     } catch (err: any) {
       console.error(`Upload error for "${item.title}":`, err);
+      let displayError = err.message || 'Transmission error';
+
+      if (displayError.includes('exceeded the number of videos')) {
+        displayError = 'Channel 24h upload limit reached. YouTube has paused new uploads.';
+        setIsProcessing(false);
+      }
+
       updateVideo(item.id, {
         status: 'FAILED',
-        errorMessage: err.message || 'Upload error',
+        errorMessage: displayError,
       });
     }
   };
@@ -315,35 +557,34 @@ export default function App() {
     if (!profile) return;
     if (isProcessing) return;
 
-    const unattached = videosRef.current.filter(
-      (v) => (v.status === 'QUEUED' || v.status === 'FAILED') && !v.file
-    );
-    if (unattached.length > 0) {
-      alert('Please re-attach the video files on items marked with "Reselect" first.');
-      return;
-    }
-
     setIsProcessing(true);
-    const eligible = videosRef.current.filter((v) => v.status === 'QUEUED' || v.status === 'FAILED');
 
-    let cursor = 0;
-    const worker = async () => {
-      while (cursor < eligible.length) {
-        const target = eligible[cursor++];
-        await uploadSingleVideo(target);
+    const runWorker = async () => {
+      while (true) {
+        const nextItem = videosRef.current.find(
+          (v) => (v.status === 'QUEUED' || v.status === 'FAILED') && Boolean(v.file)
+        );
+
+        if (!nextItem) break;
+
+        updateVideo(nextItem.id, { status: 'UPLOADING' });
+        await uploadSingleVideo(nextItem);
       }
     };
 
     const workers = Array.from(
-      { length: Math.min(concurrencyLimit, eligible.length) },
-      () => worker()
+      { length: Math.min(concurrencyLimit, 3) },
+      () => runWorker()
     );
+
     await Promise.all(workers);
     setIsProcessing(false);
   };
 
   const completedCount = videos.filter((v) => v.status === 'COMPLETED').length;
-  const uploadingCount = videos.filter((v) => v.status === 'UPLOADING').length;
+  const activeCount = videos.filter(
+    (v) => v.status === 'UPLOADING' || v.status === 'PROCESSING'
+  ).length;
 
   return (
     <div className="app-container">
@@ -368,7 +609,7 @@ export default function App() {
           </div>
           <div>
             <h1 style={{ fontSize: 18, fontWeight: 700 }}>YouTube Bulk Studio</h1>
-            <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Resumable Multi-Stream Engine</p>
+            <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Live Sync & Playlist Engine</p>
           </div>
         </div>
 
@@ -428,8 +669,8 @@ export default function App() {
       <div className="metrics-grid">
         {[
           { label: 'Total in Queue', val: videos.length, color: '#3b82f6' },
-          { label: 'Active Uploading', val: uploadingCount, color: '#f59e0b' },
-          { label: 'Completed', val: completedCount, color: '#10b981' },
+          { label: 'Active (Upload / Process)', val: activeCount, color: '#f59e0b' },
+          { label: 'Completed (Ready)', val: completedCount, color: '#10b981' },
           {
             label: 'Failed / Action Needed',
             val: videos.filter((v) => v.status === 'FAILED').length,
@@ -469,7 +710,7 @@ export default function App() {
             </label>
             <select
               value={globalConfig.privacy}
-              onChange={(e) => setGlobalConfig({ ...globalConfig, privacy: e.target.value })}
+              onChange={(e) => handlePrivacyChange(e.target.value)}
               style={{
                 width: '100%',
                 padding: '10px 12px',
@@ -514,7 +755,7 @@ export default function App() {
             </label>
             <select
               value={selectedPlaylist}
-              onChange={(e) => setSelectedPlaylist(e.target.value)}
+              onChange={(e) => handlePlaylistChange(e.target.value)}
               style={{
                 width: '100%',
                 padding: '10px 12px',
@@ -556,7 +797,7 @@ export default function App() {
                 type="radio"
                 name="kidsSetting"
                 checked={globalConfig.isMadeForKids === false}
-                onChange={() => setGlobalConfig({ ...globalConfig, isMadeForKids: false })}
+                onChange={() => handleAudienceChange(false)}
               />
               No, it's not made for kids
             </label>
@@ -565,7 +806,7 @@ export default function App() {
                 type="radio"
                 name="kidsSetting"
                 checked={globalConfig.isMadeForKids === true}
-                onChange={() => setGlobalConfig({ ...globalConfig, isMadeForKids: true })}
+                onChange={() => handleAudienceChange(true)}
               />
               Yes, it's made for kids
             </label>
@@ -632,7 +873,7 @@ export default function App() {
           id="file-input"
           type="file"
           multiple
-          accept="video/*"
+          accept="video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
           style={{ display: 'none' }}
           onChange={(e) => handleFiles(e.target.files)}
         />
@@ -660,7 +901,7 @@ export default function App() {
               <div>
                 <h2 style={{ fontSize: 16, fontWeight: 600 }}>Upload Queue</h2>
                 <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                  {uploadingCount} transmitting | {completedCount} completed
+                  {activeCount} active | {completedCount} completed
                 </p>
               </div>
 
@@ -698,13 +939,34 @@ export default function App() {
                 boxShadow: isProcessing ? 'none' : '0 4px 14px rgba(239, 68, 68, 0.4)',
               }}
             >
-              {isProcessing ? 'Transmitting In Parallel...' : 'Start Parallel Upload'}
+              {isProcessing ? 'Transmitting / Processing Videos...' : 'Start Parallel Upload'}
             </button>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {videos.map((item) => {
               const sizeMB = (item.fileSize / (1024 * 1024)).toFixed(1);
+              const isUploadingPhase = item.status === 'UPLOADING';
+              const isProcessingPhase = item.status === 'PROCESSING';
+
+              const barPercentage = isProcessingPhase
+                ? item.processingProgress || 15
+                : item.progress;
+
+              const barColor =
+                item.status === 'COMPLETED'
+                  ? '#10b981'
+                  : isProcessingPhase
+                  ? '#a855f7'
+                  : item.status === 'FAILED'
+                  ? '#ef4444'
+                  : '#3b82f6';
+
+              const currentEffectivePlaylistId = item.playlistId || selectedPlaylist;
+              const currentEffectivePlaylistTitle =
+                item.playlistTitle ||
+                playlists.find((p) => p.id === currentEffectivePlaylistId)?.snippet?.title;
+
               return (
                 <div key={item.id} className="queue-card">
                   {item.previewUrl ? (
@@ -743,7 +1005,7 @@ export default function App() {
                       <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to re-attach</span>
                       <input
                         type="file"
-                        accept="video/*"
+                        accept="video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
                         style={{ display: 'none' }}
                         onChange={(e) => {
                           if (e.target.files?.[0]) {
@@ -755,10 +1017,14 @@ export default function App() {
                   )}
 
                   <div style={{ flex: 1, minWidth: 0, width: '100%' }}>
-                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
                       <input
                         value={item.title}
-                        disabled={item.status === 'UPLOADING' || item.status === 'COMPLETED'}
+                        disabled={
+                          item.status === 'UPLOADING' ||
+                          item.status === 'PROCESSING' ||
+                          item.status === 'COMPLETED'
+                        }
                         onChange={(e) => updateVideo(item.id, { title: e.target.value })}
                         style={{
                           flex: 1,
@@ -775,22 +1041,93 @@ export default function App() {
                       </span>
                     </div>
 
+                    {/* Playlist Action & Status Row */}
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        fontSize: 11,
+                        marginBottom: 4,
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      {item.playlistAttached ? (
+                        <span style={{ color: '#86efac', fontWeight: 600 }}>
+                          📁 Saved in Playlist: <b>{currentEffectivePlaylistTitle || 'Target Playlist'}</b> ✓
+                        </span>
+                      ) : (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                          <span style={{ color: '#93c5fd' }}>📁 Target Playlist:</span>
+                          <select
+                            value={currentEffectivePlaylistId}
+                            onChange={(e) => {
+                              const pid = e.target.value;
+                              const pl = playlists.find((p) => p.id === pid);
+                              updateVideo(item.id, {
+                                playlistId: pid,
+                                playlistTitle: pl?.snippet?.title || '',
+                                playlistAttached: false,
+                              });
+                            }}
+                            style={{
+                              background: '#0b0f19',
+                              color: '#fff',
+                              border: '1px solid var(--border)',
+                              borderRadius: 4,
+                              padding: '2px 6px',
+                              fontSize: 11,
+                            }}
+                          >
+                            <option value="">-- Choose Playlist --</option>
+                            {playlists.map((pl) => (
+                              <option key={pl.id} value={pl.id}>
+                                {pl.snippet?.title}
+                              </option>
+                            ))}
+                          </select>
+
+                          {/* Save/Link Button: Always visible once a playlist is selected */}
+                          {currentEffectivePlaylistId && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                attachVideoToPlaylist(item.id, currentEffectivePlaylistId, item.videoId)
+                              }
+                              disabled={item.isAttachingPlaylist}
+                              style={{
+                                background: '#2563eb',
+                                border: 'none',
+                                color: '#fff',
+                                borderRadius: 4,
+                                padding: '3px 8px',
+                                fontSize: 10,
+                                fontWeight: 600,
+                                cursor: item.isAttachingPlaylist ? 'not-allowed' : 'pointer',
+                              }}
+                            >
+                              {item.isAttachingPlaylist ? 'Saving...' : 'Save to Playlist ⟳'}
+                            </button>
+                          )}
+
+                          {item.playlistError && (
+                            <span style={{ color: '#f87171', fontSize: 10 }}>({item.playlistError})</span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
-                      <span
-                        style={{
-                          fontWeight: 600,
-                          color:
-                            item.status === 'COMPLETED'
-                              ? '#10b981'
-                              : item.status === 'UPLOADING'
-                              ? '#3b82f6'
-                              : item.status === 'FAILED'
-                              ? '#ef4444'
-                              : '#9ca3af',
-                        }}
-                      >
-                        {item.status} {item.speedMBps > 0 && `• ${item.speedMBps} MB/s`}
-                        {item.errorMessage && ` (${item.errorMessage})`}
+                      <span style={{ fontWeight: 600, color: barColor }}>
+                        {isUploadingPhase && `Uploading: ${item.progress}% (${item.speedMBps} MB/s)`}
+                        {isProcessingPhase &&
+                          `YouTube Studio Processing: ${item.processingProgress || 15}% (SD/HD Checking...)`}
+                        {item.status === 'COMPLETED' &&
+                          (item.playlistAttached
+                            ? '✓ Completed & Added to Playlist'
+                            : '✓ Video Uploaded (Click Save to Playlist)')}
+                        {item.status === 'QUEUED' && 'Queued'}
+                        {item.status === 'FAILED' && `Failed: ${item.errorMessage || 'Error'}`}
                       </span>
 
                       {item.videoId && (
@@ -808,15 +1145,10 @@ export default function App() {
                     <div style={{ height: 6, background: '#1e293b', borderRadius: 3, overflow: 'hidden' }}>
                       <div
                         style={{
-                          width: `${item.progress}%`,
+                          width: `${barPercentage}%`,
                           height: '100%',
-                          background:
-                            item.status === 'COMPLETED'
-                              ? '#10b981'
-                              : item.status === 'FAILED'
-                              ? '#ef4444'
-                              : '#3b82f6',
-                          transition: 'width 0.2s ease',
+                          background: barColor,
+                          transition: 'width 0.3s ease',
                         }}
                       />
                     </div>
@@ -841,13 +1173,16 @@ export default function App() {
                     )}
                     <button
                       onClick={() => setVideos((vs) => vs.filter((v) => v.id !== item.id))}
-                      disabled={item.status === 'UPLOADING'}
+                      disabled={item.status === 'UPLOADING' || item.status === 'PROCESSING'}
                       style={{
                         background: 'transparent',
                         border: 'none',
                         color: '#64748b',
                         fontSize: 18,
-                        cursor: item.status === 'UPLOADING' ? 'not-allowed' : 'pointer',
+                        cursor:
+                          item.status === 'UPLOADING' || item.status === 'PROCESSING'
+                            ? 'not-allowed'
+                            : 'pointer',
                         padding: 4,
                       }}
                     >
