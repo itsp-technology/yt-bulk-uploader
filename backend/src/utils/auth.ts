@@ -1,14 +1,18 @@
-// backend/src/utils/auth.ts
 import { Env, UserRow } from '../types';
 
-export async function getValidAccessToken(env: Env, userId: string): Promise<{ token: string; user: UserRow }> {
+export async function getValidAccessToken(
+  env: Env,
+  userId: string
+): Promise<{ token: string; user: UserRow }> {
   const user = await env.DB.prepare('SELECT * FROM users WHERE id = ?')
     .bind(userId)
     .first<UserRow>();
 
-  if (!user) throw new Error('User not found');
+  if (!user) {
+    throw new Error('User not found');
+  }
 
-  // Auto-refresh token if it expires in less than 2 minutes
+  // Refresh token if it expires in less than 2 minutes
   if (Date.now() >= user.token_expiry - 120000) {
     const response = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
@@ -21,11 +25,20 @@ export async function getValidAccessToken(env: Env, userId: string): Promise<{ t
       }),
     });
 
-    const data: any = await response.json();
-    if (!response.ok) throw new Error(data.error_description || 'Failed to refresh token');
+    const data = (await response.json()) as {
+      access_token?: string;
+      expires_in?: number;
+      error_description?: string;
+    };
 
-    const newExpiry = Date.now() + data.expires_in * 1000;
-    await env.DB.prepare('UPDATE users SET access_token = ?, token_expiry = ? WHERE id = ?')
+    if (!response.ok || !data.access_token) {
+      throw new Error(data.error_description || 'Failed to refresh access token');
+    }
+
+    const newExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+    await env.DB.prepare(
+      'UPDATE users SET access_token = ?, token_expiry = ? WHERE id = ?'
+    )
       .bind(data.access_token, newExpiry, userId)
       .run();
 

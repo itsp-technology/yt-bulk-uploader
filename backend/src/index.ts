@@ -1,9 +1,8 @@
-// backend/src/index.ts
 import { Env } from './types';
 import { getValidAccessToken } from './utils/auth';
 
 const corsHeaders = (frontendUrl: string) => ({
-  'Access-Control-Allow-Origin': frontendUrl,
+  'Access-Control-Allow-Origin': frontendUrl || '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, x-user-id',
 });
@@ -41,7 +40,9 @@ export default {
       // 2. OAuth Callback
       if (url.pathname === '/api/auth/callback' && request.method === 'GET') {
         const code = url.searchParams.get('code');
-        if (!code) return new Response('Missing authorization code', { status: 400 });
+        if (!code) {
+          return new Response('Missing authorization code', { status: 400 });
+        }
 
         const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
           method: 'POST',
@@ -54,22 +55,22 @@ export default {
             grant_type: 'authorization_code',
           }),
         });
-        const tokens: any = await tokenRes.json();
+        const tokens = (await tokenRes.json()) as any;
 
         if (!tokenRes.ok) {
-          return new Response(`Token Exchange Failed: ${JSON.stringify(tokens)}`, { status: 400 });
+          return new Response(`Token exchange failed: ${JSON.stringify(tokens)}`, { status: 400 });
         }
 
         const userProfileRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
           headers: { Authorization: `Bearer ${tokens.access_token}` },
         });
-        const profile: any = await userProfileRes.json();
+        const profile = (await userProfileRes.json()) as any;
 
         const channelRes = await fetch(
           'https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true',
           { headers: { Authorization: `Bearer ${tokens.access_token}` } }
         );
-        const channelData: any = await channelRes.json();
+        const channelData = (await channelRes.json()) as any;
         const channel = channelData.items?.[0];
 
         const userId = crypto.randomUUID();
@@ -104,7 +105,7 @@ export default {
         return Response.redirect(`${env.FRONTEND_URL}/?userId=${finalUser?.id}`, 302);
       }
 
-      // Check for user ID on all data routes
+      // Check authorization header for all subsequent routes
       const userId = request.headers.get('x-user-id');
       if (!userId) {
         return Response.json({ error: 'Unauthorized: Missing x-user-id' }, { status: 401, headers });
@@ -113,17 +114,18 @@ export default {
       // 3. Playlists: List
       if (url.pathname === '/api/playlists' && request.method === 'GET') {
         const { token } = await getValidAccessToken(env, userId);
-        const res = await fetch('https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true&maxResults=50', {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        const data: any = await res.json();
+        const res = await fetch(
+          'https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true&maxResults=50',
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const data = (await res.json()) as any;
         return Response.json(data.items || [], { headers });
       }
 
       // 4. Playlists: Create
       if (url.pathname === '/api/playlists' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
-        const { title, description, privacy } = await request.json<any>();
+        const body = (await request.json()) as any;
 
         const res = await fetch('https://www.googleapis.com/youtube/v3/playlists?part=snippet,status', {
           method: 'POST',
@@ -132,18 +134,18 @@ export default {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
-            snippet: { title, description },
-            status: { privacyStatus: privacy || 'unlisted' },
+            snippet: { title: body.title, description: body.description },
+            status: { privacyStatus: body.privacy || 'unlisted' },
           }),
         });
-        const data = await res.json();
+        const data = (await res.json()) as any;
         return Response.json(data, { headers });
       }
 
       // 5. Initialize Resumable Upload
       if (url.pathname === '/api/uploads/initialize' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
-        const body = await request.json<any>();
+        const body = (await request.json()) as any;
 
         const initialRes = await fetch(
           'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
@@ -159,7 +161,9 @@ export default {
               snippet: {
                 title: body.title,
                 description: body.description,
-                tags: Array.isArray(body.tags) ? body.tags : body.tags?.split(',').map((t: string) => t.trim()),
+                tags: Array.isArray(body.tags)
+                  ? body.tags
+                  : body.tags?.split(',').map((t: string) => t.trim()),
                 categoryId: body.categoryId || '27',
               },
               status: {
@@ -174,7 +178,10 @@ export default {
         const uploadUri = initialRes.headers.get('Location');
         if (!uploadUri) {
           const errData = await initialRes.text();
-          return Response.json({ error: 'Failed to obtain resumable URI', details: errData }, { status: 500, headers });
+          return Response.json(
+            { error: 'Failed to obtain resumable URI', details: errData },
+            { status: 500, headers }
+          );
         }
 
         const uploadId = crypto.randomUUID();
@@ -199,7 +206,7 @@ export default {
       // 6. Attach to Playlist
       if (url.pathname === '/api/playlists/attach' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
-        const { playlistId, videoId } = await request.json<any>();
+        const body = (await request.json()) as any;
 
         const res = await fetch('https://www.googleapis.com/youtube/v3/playlistItems?part=snippet', {
           method: 'POST',
@@ -209,13 +216,13 @@ export default {
           },
           body: JSON.stringify({
             snippet: {
-              playlistId,
-              resourceId: { kind: 'youtube#video', videoId },
+              playlistId: body.playlistId,
+              resourceId: { kind: 'youtube#video', videoId: body.videoId },
             },
           }),
         });
 
-        const data = await res.json();
+        const data = (await res.json()) as any;
         return Response.json(data, { headers });
       }
 

@@ -1,5 +1,5 @@
 // frontend/src/App.tsx
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
 const API_BASE = 'http://localhost:8787';
@@ -25,6 +25,12 @@ export default function App() {
   const [playlists, setPlaylists] = useState<any[]>([]);
   const [selectedPlaylist, setSelectedPlaylist] = useState('');
   const [newPlaylistTitle, setNewPlaylistTitle] = useState('');
+  const [concurrencyLimit, setConcurrencyLimit] = useState<number>(3);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
+
+  // Ref to access the latest videos state inside async worker loops without race conditions
+  const videosRef = useRef<VideoFileItem[]>([]);
+  videosRef.current = videos;
 
   const [globalConfig, setGlobalConfig] = useState({
     privacy: 'unlisted',
@@ -105,66 +111,103 @@ export default function App() {
     setVideos((items) => items.map((item) => (item.id === id ? { ...item, ...fields } : item)));
   };
 
-  const startUploadProcess = async () => {
-    if (!userId) return alert('Log in with Google first.');
+  // Upload single video handler
+  const uploadSingleVideo = async (item: VideoFileItem) => {
+    if (!userId) return;
 
-    for (const item of videos) {
-      if (item.status === 'COMPLETED') continue;
+    updateVideo(item.id, { status: 'UPLOADING' });
 
-      updateVideo(item.id, { status: 'UPLOADING' });
+    try {
+      // 1. Initialize Resumable Session URI
+      const initRes = await fetch(`${API_BASE}/api/uploads/initialize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-user-id': userId },
+        body: JSON.stringify({
+          title: item.title,
+          description: item.description,
+          tags: item.tags,
+          privacyStatus: item.privacyStatus,
+          categoryId: globalConfig.categoryId,
+          fileSize: item.file.size,
+          mimeType: item.file.type,
+          playlistId: selectedPlaylist || undefined,
+        }),
+      });
 
-      try {
-        const initRes = await fetch(`${API_BASE}/api/uploads/initialize`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-user-id': userId },
-          body: JSON.stringify({
-            title: item.title,
-            description: item.description,
-            tags: item.tags,
-            privacyStatus: item.privacyStatus,
-            categoryId: globalConfig.categoryId,
-            fileSize: item.file.size,
-            mimeType: item.file.type,
-            playlistId: selectedPlaylist || undefined,
-          }),
-        });
+      const { uploadUri } = await initRes.json();
+      if (!uploadUri) throw new Error('No upload URI returned from server');
 
-        const { uploadUri } = await initRes.json();
-        if (!uploadUri) throw new Error('No upload URI returned');
-
-        const uploader = new ResumableChunkUploader(
-          item.file,
-          uploadUri,
-          (progress) => {
-            updateVideo(item.id, {
-              progress: progress.percentage,
-              speedMBps: progress.speedMBps,
-            });
-          }
-        );
-
-        updateVideo(item.id, { uploader });
-        const { videoId } = await uploader.start();
-
-        if (selectedPlaylist) {
-          await fetch(`${API_BASE}/api/playlists/attach`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-user-id': userId },
-            body: JSON.stringify({ playlistId: selectedPlaylist, videoId }),
+      // 2. Stream Chunks to Google
+      const uploader = new ResumableChunkUploader(
+        item.file,
+        uploadUri,
+        (progress) => {
+          updateVideo(item.id, {
+            progress: progress.percentage,
+            speedMBps: progress.speedMBps,
           });
         }
+      );
 
-        updateVideo(item.id, { status: 'COMPLETED', progress: 100, videoId });
-      } catch (err) {
-        console.error(err);
-        updateVideo(item.id, { status: 'FAILED' });
+      updateVideo(item.id, { uploader });
+      const { videoId } = await uploader.start();
+
+      // 3. Attach to YouTube Playlist
+      if (selectedPlaylist) {
+        await fetch(`${API_BASE}/api/playlists/attach`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-user-id': userId },
+          body: JSON.stringify({ playlistId: selectedPlaylist, videoId }),
+        });
       }
+
+      updateVideo(item.id, { status: 'COMPLETED', progress: 100, videoId });
+    } catch (err) {
+      console.error(`Upload failed for "${item.title}":`, err);
+      updateVideo(item.id, { status: 'FAILED' });
     }
   };
 
+  // Parallel Queue Dispatcher with Concurrency Control
+  const startParallelUploads = async () => {
+    if (!userId) return alert('Log in with Google first.');
+    if (isProcessing) return;
+
+    setIsProcessing(true);
+
+    // Get all items eligible for upload (QUEUED or FAILED)
+    const eligibleItems = videosRef.current.filter(
+      (v) => v.status === 'QUEUED' || v.status === 'FAILED'
+    );
+
+    if (eligibleItems.length === 0) {
+      setIsProcessing(false);
+      return;
+    }
+
+    let cursor = 0;
+
+    // Worker that pulls the next available video item from the shared queue
+    const worker = async () => {
+      while (cursor < eligibleItems.length) {
+        const item = eligibleItems[cursor++];
+        await uploadSingleVideo(item);
+      }
+    };
+
+    // Spawn N parallel workers according to concurrencyLimit
+    const activeWorkers = Array.from(
+      { length: Math.min(concurrencyLimit, eligibleItems.length) },
+      () => worker()
+    );
+
+    await Promise.all(activeWorkers);
+    setIsProcessing(false);
+  };
+
   return (
-    <div style={{ maxWidth: 900, margin: '30px auto', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
-      <h2>Bulk YouTube Video Uploader (Local)</h2>
+    <div style={{ maxWidth: 960, margin: '30px auto', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+      <h2>Bulk YouTube Video Uploader</h2>
 
       {!userId ? (
         <button onClick={loginGoogle} style={{ padding: '10px 16px', fontSize: 16, cursor: 'pointer' }}>
@@ -176,10 +219,10 @@ export default function App() {
         </div>
       )}
 
-      {/* Common Config */}
+      {/* Common Upload Settings */}
       <fieldset style={{ marginTop: 20, padding: 16, borderRadius: 8 }}>
         <legend>Common Upload Settings</legend>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
           <div>
             <label>Privacy: </label>
             <select
@@ -193,6 +236,21 @@ export default function App() {
           </div>
 
           <div>
+            <label>Parallel Limit: </label>
+            <select
+              value={concurrencyLimit}
+              disabled={isProcessing}
+              onChange={(e) => setConcurrencyLimit(Number(e.target.value))}
+            >
+              <option value="1">1 (Sequential)</option>
+              <option value="2">2 Concurrent</option>
+              <option value="3">3 Concurrent</option>
+              <option value="4">4 Concurrent</option>
+              <option value="5">5 Concurrent</option>
+            </select>
+          </div>
+
+          <div>
             <label>Add to Playlist: </label>
             <select value={selectedPlaylist} onChange={(e) => setSelectedPlaylist(e.target.value)}>
               <option value="">-- No Playlist --</option>
@@ -202,7 +260,7 @@ export default function App() {
             </select>
           </div>
 
-          <div style={{ gridColumn: 'span 2', display: 'flex', gap: 8 }}>
+          <div style={{ gridColumn: 'span 3', display: 'flex', gap: 8 }}>
             <input
               placeholder="Create new playlist..."
               value={newPlaylistTitle}
@@ -220,7 +278,10 @@ export default function App() {
 
       {/* Queue View */}
       <div style={{ marginTop: 24 }}>
-        <h3>Queue ({videos.length} items)</h3>
+        <h3>
+          Queue ({videos.length} videos | {videos.filter((v) => v.status === 'UPLOADING').length} uploading concurrently)
+        </h3>
+
         {videos.map((item) => (
           <div
             key={item.id}
@@ -232,9 +293,10 @@ export default function App() {
               padding: 12,
               marginBottom: 10,
               borderRadius: 6,
+              background: item.status === 'UPLOADING' ? '#f0f7ff' : '#fff',
             }}
           >
-            <video src={item.previewUrl} width={90} height={55} style={{ background: '#000' }} />
+            <video src={item.previewUrl} width={90} height={55} style={{ background: '#000', borderRadius: 4 }} />
 
             <div style={{ flex: 1 }}>
               <input
@@ -246,11 +308,29 @@ export default function App() {
               />
 
               <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 13 }}>
-                <span>Status: <b>{item.status}</b></span>
-                {item.speedMBps > 0 && <span>{item.speedMBps} MB/s</span>}
+                <span>
+                  Status:{' '}
+                  <b
+                    style={{
+                      color:
+                        item.status === 'COMPLETED'
+                          ? 'green'
+                          : item.status === 'UPLOADING'
+                          ? '#0066cc'
+                          : item.status === 'FAILED'
+                          ? 'red'
+                          : '#555',
+                    }}
+                  >
+                    {item.status}
+                  </b>
+                </span>
+                {item.speedMBps > 0 && item.status === 'UPLOADING' && (
+                  <span style={{ color: '#0066cc', fontWeight: 600 }}>{item.speedMBps} MB/s</span>
+                )}
                 {item.videoId && (
                   <a href={`https://youtu.be/${item.videoId}`} target="_blank" rel="noreferrer">
-                    Watch on YouTube
+                    Watch on YouTube ↗
                   </a>
                 )}
               </div>
@@ -261,6 +341,7 @@ export default function App() {
                     width: `${item.progress}%`,
                     background: item.status === 'FAILED' ? 'red' : item.status === 'COMPLETED' ? 'green' : '#0066cc',
                     height: '100%',
+                    transition: 'width 0.2s linear',
                   }}
                 />
               </div>
@@ -278,19 +359,20 @@ export default function App() {
 
       {videos.length > 0 && (
         <button
-          onClick={startUploadProcess}
+          onClick={startParallelUploads}
+          disabled={isProcessing}
           style={{
             marginTop: 16,
             padding: '12px 24px',
-            backgroundColor: '#ff0000',
+            backgroundColor: isProcessing ? '#999' : '#ff0000',
             color: '#fff',
             border: 'none',
             borderRadius: 6,
             fontSize: 16,
-            cursor: 'pointer',
+            cursor: isProcessing ? 'not-allowed' : 'pointer',
           }}
         >
-          Upload All to YouTube
+          {isProcessing ? 'Uploading in Parallel...' : 'Upload All in Parallel'}
         </button>
       )}
     </div>
