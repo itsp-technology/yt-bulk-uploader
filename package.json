@@ -2,8 +2,7 @@
   "name": "yt-bulk-uploader",
   "private": true,
   "scripts": {
-    "build:frontend": "npm --prefix frontend install && npm --prefix frontend run build",
-    "deploy": "npm run build:frontend && wrangler deploy",
+    "build": "npm --prefix frontend install && npm --prefix frontend run build",
     "dev:backend": "wrangler dev",
     "dev:frontend": "npm run dev --prefix frontend",
     "dev": "concurrently -k -p \"[{name}]\" -n \"BACKEND,FRONTEND\" -c \"yellow.bold,cyan.bold\" \"npm run dev:backend\" \"npm run dev:frontend\""
