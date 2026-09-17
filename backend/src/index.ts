@@ -1,3 +1,4 @@
+// backend/src/index.ts
 import { Env } from './types';
 import { getValidAccessToken } from './utils/auth';
 
@@ -105,7 +106,7 @@ export default {
         return Response.redirect(`${env.FRONTEND_URL}/?userId=${finalUser?.id}`, 302);
       }
 
-      // Check authorization header for all subsequent routes
+      // Check authorization header
       const userId = request.headers.get('x-user-id');
       if (!userId) {
         return Response.json({ error: 'Unauthorized: Missing x-user-id' }, { status: 401, headers });
@@ -156,7 +157,7 @@ export default {
         return Response.json(data, { headers });
       }
 
-      // 6. Initialize Resumable Upload
+      // 6. Initialize Resumable Upload (with COPPA Made for Kids)
       if (url.pathname === '/api/uploads/initialize' && request.method === 'POST') {
         const { token } = await getValidAccessToken(env, userId);
         const body = (await request.json()) as any;
@@ -174,7 +175,7 @@ export default {
             body: JSON.stringify({
               snippet: {
                 title: body.title,
-                description: body.description,
+                description: body.description || '',
                 tags: Array.isArray(body.tags)
                   ? body.tags
                   : body.tags?.split(',').map((t: string) => t.trim()),
@@ -182,7 +183,7 @@ export default {
               },
               status: {
                 privacyStatus: body.privacyStatus || 'unlisted',
-                selfDeclaredMadeForKids: Boolean(body.isMadeForKids),
+                selfDeclaredMadeForKids: Boolean(body.isMadeForKids), // Mandatory COPPA setting
                 embeddable: true,
               },
             }),

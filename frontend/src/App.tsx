@@ -1,7 +1,9 @@
+// frontend/src/App.tsx
 import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
 const API_BASE = 'http://localhost:8787';
+const QUEUE_STORAGE_KEY = 'yt_upload_queue_v2';
 
 interface UserProfile {
   id: string;
@@ -14,22 +16,25 @@ interface UserProfile {
 
 interface VideoFileItem {
   id: string;
-  file: File;
+  file?: File;
+  fileName: string;
+  fileSize: number;
   previewUrl: string;
   title: string;
   description: string;
   tags: string;
   privacyStatus: string;
+  isMadeForKids: boolean;
   status: 'QUEUED' | 'UPLOADING' | 'COMPLETED' | 'FAILED' | 'PAUSED';
   progress: number;
   speedMBps: number;
+  uploadUri?: string;
   videoId?: string;
   uploader?: ResumableChunkUploader;
 }
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
-  const [videos, setVideos] = useState<VideoFileItem[]>([]);
   const [playlists, setPlaylists] = useState<any[]>([]);
   const [selectedPlaylist, setSelectedPlaylist] = useState('');
   const [newPlaylistTitle, setNewPlaylistTitle] = useState('');
@@ -37,15 +42,63 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [isDragging, setIsDragging] = useState<boolean>(false);
 
-  const videosRef = useRef<VideoFileItem[]>([]);
-  videosRef.current = videos;
-
+  // Global settings including the mandatory Made for Kids COPPA question
   const [globalConfig, setGlobalConfig] = useState({
     privacy: 'unlisted',
     description: '',
     tags: 'bulk, upload',
     categoryId: '27',
+    isMadeForKids: false, // Default: Not made for kids (standard YouTube requirement)
   });
+
+  const [videos, setVideos] = useState<VideoFileItem[]>(() => {
+    try {
+      const saved = localStorage.getItem(QUEUE_STORAGE_KEY);
+      if (saved) {
+        const parsed: VideoFileItem[] = JSON.parse(saved);
+        return parsed.map((v) => ({
+          ...v,
+          // If interrupted mid-upload, set back to QUEUED (never stuck on failed)
+          status: v.status === 'UPLOADING' ? 'QUEUED' : v.status,
+          uploader: undefined,
+          file: undefined,
+        }));
+      }
+    } catch (e) {
+      console.error('Failed to load queue from storage', e);
+    }
+    return [];
+  });
+
+  const videosRef = useRef<VideoFileItem[]>([]);
+  videosRef.current = videos;
+
+  // Warn user before closing/reloading if an upload is active
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      const isUploading = videosRef.current.some((v) => v.status === 'UPLOADING');
+      if (isUploading) {
+        e.preventDefault();
+        e.returnValue = 'Videos are currently uploading. Reloading will pause them.';
+        return e.returnValue;
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, []);
+
+  // Persist queue metadata & session URIs to localStorage
+  useEffect(() => {
+    try {
+      const serialized = videos.map(({ uploader, file, previewUrl, ...rest }) => ({
+        ...rest,
+        previewUrl: previewUrl.startsWith('blob:') ? '' : previewUrl,
+      }));
+      localStorage.setItem(QUEUE_STORAGE_KEY, JSON.stringify(serialized));
+    } catch (e) {
+      console.error('Queue save failed', e);
+    }
+  }, [videos]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -81,6 +134,7 @@ export default function App() {
 
   const logout = () => {
     localStorage.removeItem('yt_user_id');
+    localStorage.removeItem(QUEUE_STORAGE_KEY);
     setProfile(null);
     setVideos([]);
   };
@@ -122,51 +176,103 @@ export default function App() {
 
   const handleFiles = (fileList: FileList | null) => {
     if (!fileList) return;
-    const newItems: VideoFileItem[] = Array.from(fileList)
+    const incoming: VideoFileItem[] = [];
+
+    Array.from(fileList)
       .filter((f) => f.type.startsWith('video/'))
-      .map((f) => ({
-        id: crypto.randomUUID(),
-        file: f,
-        previewUrl: URL.createObjectURL(f),
-        title: f.name.replace(/\.[^/.]+$/, ''),
-        description: globalConfig.description,
-        tags: globalConfig.tags,
-        privacyStatus: globalConfig.privacy,
-        status: 'QUEUED',
-        progress: 0,
-        speedMBps: 0,
-      }));
-    setVideos((prev) => [...prev, ...newItems]);
+      .forEach((f) => {
+        // Match existing queue item by filename and size to re-link after a reload
+        const existingIndex = videosRef.current.findIndex(
+          (v) => v.fileName === f.name && Math.abs(v.fileSize - f.size) < 1000
+        );
+
+        if (existingIndex !== -1) {
+          updateVideo(videosRef.current[existingIndex].id, {
+            file: f,
+            previewUrl: URL.createObjectURL(f),
+            status: videosRef.current[existingIndex].status === 'FAILED' ? 'QUEUED' : videosRef.current[existingIndex].status,
+          });
+        } else {
+          incoming.push({
+            id: crypto.randomUUID(),
+            file: f,
+            fileName: f.name,
+            fileSize: f.size,
+            previewUrl: URL.createObjectURL(f),
+            title: f.name.replace(/\.[^/.]+$/, ''),
+            description: globalConfig.description,
+            tags: globalConfig.tags,
+            privacyStatus: globalConfig.privacy,
+            isMadeForKids: globalConfig.isMadeForKids,
+            status: 'QUEUED',
+            progress: 0,
+            speedMBps: 0,
+          });
+        }
+      });
+
+    if (incoming.length > 0) {
+      setVideos((prev) => [...prev, ...incoming]);
+    }
+  };
+
+  // Re-attach an individual file if user refreshed mid-upload
+  const handleSingleFileReselect = (id: string, file: File) => {
+    updateVideo(id, {
+      file,
+      fileName: file.name,
+      fileSize: file.size,
+      previewUrl: URL.createObjectURL(file),
+      status: 'QUEUED',
+    });
   };
 
   const updateVideo = (id: string, fields: Partial<VideoFileItem>) => {
     setVideos((items) => items.map((item) => (item.id === id ? { ...item, ...fields } : item)));
   };
 
+  const clearCompleted = () => {
+    setVideos((items) => items.filter((v) => v.status !== 'COMPLETED'));
+  };
+
   const uploadSingleVideo = async (item: VideoFileItem) => {
     if (!profile) return;
+    if (!item.file) {
+      alert(`Please click "Select File" on "${item.title}" to reattach it before uploading.`);
+      return;
+    }
+
     updateVideo(item.id, { status: 'UPLOADING' });
 
     try {
-      const initRes = await fetch(`${API_BASE}/api/uploads/initialize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
-        body: JSON.stringify({
-          title: item.title,
-          description: item.description,
-          tags: item.tags,
-          privacyStatus: item.privacyStatus,
-          categoryId: globalConfig.categoryId,
-          fileSize: item.file.size,
-          mimeType: item.file.type,
-          playlistId: selectedPlaylist || undefined,
-        }),
-      });
+      let uploadUri = item.uploadUri;
 
-      const { uploadUri } = await initRes.json();
-      if (!uploadUri) throw new Error('Could not get upload URI');
+      // Only initialize a new session if one doesn't exist
+      if (!uploadUri) {
+        const initRes = await fetch(`${API_BASE}/api/uploads/initialize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-user-id': profile.id },
+          body: JSON.stringify({
+            title: item.title,
+            description: item.description,
+            tags: item.tags,
+            privacyStatus: item.privacyStatus,
+            isMadeForKids: item.isMadeForKids,
+            categoryId: globalConfig.categoryId,
+            fileSize: item.file.size,
+            mimeType: item.file.type,
+            playlistId: selectedPlaylist || undefined,
+          }),
+        });
 
-      const uploader = new ResumableChunkUploader(item.file, uploadUri, (progress) => {
+        const data = await initRes.json();
+        if (!data.uploadUri) throw new Error(data.error || 'Could not get upload URI');
+        uploadUri = data.uploadUri;
+        updateVideo(item.id, { uploadUri });
+      }
+
+      // Stream Chunks (auto-resumes from remote offset if existing session)
+      const uploader = new ResumableChunkUploader(item.file, uploadUri!, (progress) => {
         updateVideo(item.id, {
           progress: progress.percentage,
           speedMBps: progress.speedMBps,
@@ -185,7 +291,8 @@ export default function App() {
       }
 
       updateVideo(item.id, { status: 'COMPLETED', progress: 100, videoId });
-    } catch {
+    } catch (err) {
+      console.error(err);
       updateVideo(item.id, { status: 'FAILED' });
     }
   };
@@ -193,6 +300,13 @@ export default function App() {
   const startParallelUploads = async () => {
     if (!profile) return;
     if (isProcessing) return;
+
+    // Check for missing file attachments first
+    const unattached = videosRef.current.filter((v) => (v.status === 'QUEUED' || v.status === 'FAILED') && !v.file);
+    if (unattached.length > 0) {
+      alert(`Please click "Select File" to re-attach the video file(s) for the restored items.`);
+      return;
+    }
 
     setIsProcessing(true);
     const eligible = videosRef.current.filter((v) => v.status === 'QUEUED' || v.status === 'FAILED');
@@ -214,24 +328,13 @@ export default function App() {
   const uploadingCount = videos.filter((v) => v.status === 'UPLOADING').length;
 
   return (
-    <div style={{ maxWidth: 1100, margin: '0 auto', padding: '24px 20px' }}>
-      {/* Top Navigation Bar */}
-      <header
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          padding: '16px 24px',
-          background: 'var(--bg-card)',
-          borderRadius: 16,
-          border: '1px solid var(--border)',
-          marginBottom: 24,
-        }}
-      >
+    <div className="app-container">
+      {/* Header */}
+      <header className="dashboard-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div
             style={{
-              width: 40,
+              minWidth: 40,
               height: 40,
               borderRadius: 10,
               background: '#ef4444',
@@ -240,7 +343,7 @@ export default function App() {
               justifyContent: 'center',
               fontWeight: 800,
               color: '#fff',
-              fontSize: 20,
+              fontSize: 18,
             }}
           >
             ▶
@@ -252,22 +355,22 @@ export default function App() {
         </div>
 
         {profile ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, textAlign: 'right' }}>
-              <div>
-                <div style={{ fontSize: 14, fontWeight: 600 }}>{profile.channel_title || profile.name}</div>
-                <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{profile.email}</div>
-              </div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <img
                 src={profile.avatar || 'https://via.placeholder.com/40'}
                 alt="Channel avatar"
-                style={{ width: 42, height: 42, borderRadius: '50%', border: '2px solid #ef4444' }}
+                style={{ width: 38, height: 38, borderRadius: '50%', border: '2px solid #ef4444' }}
               />
+              <div style={{ textAlign: 'left' }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{profile.channel_title || profile.name}</div>
+                <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{profile.email}</div>
+              </div>
             </div>
             <button
               onClick={logout}
               style={{
-                padding: '8px 14px',
+                padding: '6px 12px',
                 borderRadius: 8,
                 background: '#1e293b',
                 color: '#94a3b8',
@@ -285,14 +388,17 @@ export default function App() {
             style={{
               display: 'flex',
               alignItems: 'center',
+              justifyContent: 'center',
               gap: 10,
-              padding: '10px 20px',
+              padding: '10px 16px',
               background: '#ef4444',
               color: '#fff',
               border: 'none',
               borderRadius: 10,
               fontWeight: 600,
               cursor: 'pointer',
+              width: '100%',
+              maxWidth: 240,
             }}
           >
             Connect YouTube Account
@@ -301,12 +407,12 @@ export default function App() {
       </header>
 
       {/* Metrics Row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>
+      <div className="metrics-grid">
         {[
           { label: 'Total in Queue', val: videos.length, color: '#3b82f6' },
           { label: 'Active Uploading', val: uploadingCount, color: '#f59e0b' },
           { label: 'Completed', val: completedCount, color: '#10b981' },
-          { label: 'Failed', val: videos.filter((v) => v.status === 'FAILED').length, color: '#ef4444' },
+          { label: 'Failed / Paused', val: videos.filter((v) => v.status === 'FAILED').length, color: '#ef4444' },
         ].map((item, idx) => (
           <div
             key={idx}
@@ -314,27 +420,27 @@ export default function App() {
               background: 'var(--bg-card)',
               border: '1px solid var(--border)',
               borderRadius: 12,
-              padding: '16px 20px',
+              padding: '12px 16px',
             }}
           >
-            <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 6 }}>{item.label}</div>
-            <div style={{ fontSize: 24, fontWeight: 700, color: item.color }}>{item.val}</div>
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>{item.label}</div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: item.color }}>{item.val}</div>
           </div>
         ))}
       </div>
 
-      {/* Common Settings Card */}
+      {/* Common Upload Configuration */}
       <section
         style={{
           background: 'var(--bg-card)',
           border: '1px solid var(--border)',
           borderRadius: 16,
-          padding: 24,
-          marginBottom: 24,
+          padding: 18,
+          marginBottom: 20,
         }}
       >
-        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 16 }}>Common Upload Configuration</h2>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 16 }}>
+        <h2 style={{ fontSize: 15, fontWeight: 600, marginBottom: 14 }}>Common Upload Configuration</h2>
+        <div className="config-grid">
           <div>
             <label style={{ display: 'block', fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 }}>
               Default Privacy
@@ -407,7 +513,46 @@ export default function App() {
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: 10 }}>
+        {/* Mandatory YouTube Audience Setting (COPPA) */}
+        <div
+          style={{
+            padding: '12px 14px',
+            background: '#0b0f19',
+            borderRadius: 10,
+            border: '1px solid var(--border)',
+            marginBottom: 14,
+          }}
+        >
+          <div style={{ fontSize: 13, fontWeight: 600, color: '#f3f4f6', marginBottom: 4 }}>
+            Audience: Is this content made for kids? (Mandatory YouTube Requirement)
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10 }}>
+            Regardless of location, you are legally required to comply with COPPA.
+          </div>
+          <div style={{ display: 'flex', gap: 20, fontSize: 13 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <input
+                type="radio"
+                name="kidsSetting"
+                checked={globalConfig.isMadeForKids === false}
+                onChange={() => setGlobalConfig({ ...globalConfig, isMadeForKids: false })}
+              />
+              No, it's not made for kids
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+              <input
+                type="radio"
+                name="kidsSetting"
+                checked={globalConfig.isMadeForKids === true}
+                onChange={() => setGlobalConfig({ ...globalConfig, isMadeForKids: true })}
+              />
+              Yes, it's made for kids
+            </label>
+          </div>
+        </div>
+
+        {/* Quick Playlist Creation */}
+        <div className="playlist-action-row">
           <input
             placeholder="Quick create playlist and select..."
             value={newPlaylistTitle}
@@ -425,7 +570,7 @@ export default function App() {
             type="button"
             onClick={createPlaylist}
             style={{
-              padding: '10px 20px',
+              padding: '10px 18px',
               background: '#2563eb',
               color: '#fff',
               border: 'none',
@@ -439,7 +584,7 @@ export default function App() {
         </div>
       </section>
 
-      {/* Drag & Drop File Picker */}
+      {/* Drag & Drop Target */}
       <div
         onDragOver={(e) => {
           e.preventDefault();
@@ -454,10 +599,10 @@ export default function App() {
         style={{
           border: `2px dashed ${isDragging ? '#3b82f6' : 'var(--border)'}`,
           borderRadius: 16,
-          padding: '40px 20px',
+          padding: '30px 16px',
           textAlign: 'center',
           background: isDragging ? 'rgba(59, 130, 246, 0.05)' : 'var(--bg-card)',
-          marginBottom: 24,
+          marginBottom: 20,
           cursor: 'pointer',
         }}
         onClick={() => document.getElementById('file-input')?.click()}
@@ -470,38 +615,58 @@ export default function App() {
           style={{ display: 'none' }}
           onChange={(e) => handleFiles(e.target.files)}
         />
-        <div style={{ fontSize: 32, marginBottom: 8 }}>📁</div>
-        <div style={{ fontSize: 16, fontWeight: 600, color: '#f3f4f6' }}>
-          Drag & Drop Video Files Here, or Click to Browse
+        <div style={{ fontSize: 28, marginBottom: 8 }}>📁</div>
+        <div style={{ fontSize: 15, fontWeight: 600, color: '#f3f4f6' }}>
+          Tap to Select or Drag & Drop Videos
         </div>
-        <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
+        <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
           MP4, MOV, MKV, WebM supported
         </div>
       </div>
 
-      {/* Upload Queue View */}
+      {/* Queue View */}
       {videos.length > 0 && (
         <section
           style={{
             background: 'var(--bg-card)',
             border: '1px solid var(--border)',
             borderRadius: 16,
-            padding: 24,
+            padding: 16,
           }}
         >
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-            <div>
-              <h2 style={{ fontSize: 16, fontWeight: 600 }}>Upload Queue</h2>
-              <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-                {uploadingCount} of {videos.length} videos transmitting
-              </p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <h2 style={{ fontSize: 16, fontWeight: 600 }}>Upload Queue</h2>
+                <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
+                  {uploadingCount} transmitting | {completedCount} finished
+                </p>
+              </div>
+
+              {completedCount > 0 && (
+                <button
+                  onClick={clearCompleted}
+                  style={{
+                    background: 'transparent',
+                    border: '1px solid var(--border)',
+                    color: 'var(--text-secondary)',
+                    padding: '6px 12px',
+                    borderRadius: 6,
+                    fontSize: 12,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Clear Completed
+                </button>
+              )}
             </div>
 
             <button
               onClick={startParallelUploads}
               disabled={isProcessing || !profile}
               style={{
-                padding: '12px 28px',
+                width: '100%',
+                padding: '12px 20px',
                 background: isProcessing ? '#475569' : '#ef4444',
                 color: '#fff',
                 border: 'none',
@@ -512,33 +677,64 @@ export default function App() {
                 boxShadow: isProcessing ? 'none' : '0 4px 14px rgba(239, 68, 68, 0.4)',
               }}
             >
-              {isProcessing ? 'Processing Concurrent Uploads...' : 'Start Parallel Upload'}
+              {isProcessing ? 'Transmitting In Parallel...' : 'Start Parallel Upload'}
             </button>
           </div>
 
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             {videos.map((item) => {
-              const sizeMB = (item.file.size / (1024 * 1024)).toFixed(1);
+              const sizeMB = (item.fileSize / (1024 * 1024)).toFixed(1);
               return (
-                <div
-                  key={item.id}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 16,
-                    padding: 16,
-                    background: '#0b0f19',
-                    borderRadius: 12,
-                    border: '1px solid var(--border)',
-                  }}
-                >
-                  <video
-                    src={item.previewUrl}
-                    style={{ width: 100, height: 60, borderRadius: 8, objectFit: 'cover', background: '#000' }}
-                  />
+                <div key={item.id} className="queue-card">
+                  {item.previewUrl ? (
+                    <video
+                      src={item.previewUrl}
+                      style={{
+                        width: '100%',
+                        maxWidth: 110,
+                        height: 65,
+                        borderRadius: 8,
+                        objectFit: 'cover',
+                        background: '#000',
+                      }}
+                    />
+                  ) : (
+                    <label
+                      style={{
+                        width: '100%',
+                        maxWidth: 110,
+                        height: 65,
+                        borderRadius: 8,
+                        background: '#1f293d',
+                        border: '1px dashed #3b82f6',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontSize: 11,
+                        color: '#60a5fa',
+                        cursor: 'pointer',
+                        padding: 4,
+                        textAlign: 'center',
+                      }}
+                    >
+                      <span>📎 Select File</span>
+                      <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to resume</span>
+                      <input
+                        type="file"
+                        accept="video/*"
+                        style={{ display: 'none' }}
+                        onChange={(e) => {
+                          if (e.target.files?.[0]) {
+                            handleSingleFileReselect(item.id, e.target.files[0]);
+                          }
+                        }}
+                      />
+                    </label>
+                  )}
 
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 6 }}>
+                  <div style={{ flex: 1, minWidth: 0, width: '100%' }}>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
                       <input
                         value={item.title}
                         disabled={item.status === 'UPLOADING' || item.status === 'COMPLETED'}
@@ -550,10 +746,12 @@ export default function App() {
                           border: '1px solid var(--border)',
                           borderRadius: 6,
                           color: '#fff',
-                          fontSize: 14,
+                          fontSize: 13,
                         }}
                       />
-                      <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{sizeMB} MB</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+                        {sizeMB} MB
+                      </span>
                     </div>
 
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 6 }}>
@@ -606,12 +804,13 @@ export default function App() {
                     onClick={() => setVideos((vs) => vs.filter((v) => v.id !== item.id))}
                     disabled={item.status === 'UPLOADING'}
                     style={{
+                      alignSelf: 'flex-end',
                       background: 'transparent',
                       border: 'none',
                       color: '#64748b',
                       fontSize: 18,
                       cursor: item.status === 'UPLOADING' ? 'not-allowed' : 'pointer',
-                      padding: 8,
+                      padding: 4,
                     }}
                   >
                     ✕
