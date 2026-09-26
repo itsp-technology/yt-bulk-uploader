@@ -14,6 +14,7 @@ export class ResumableChunkUploader {
   private chunkSize = 10 * 1024 * 1024;
   private isPaused = false;
   private isCancelled = false;
+  private activeXhr: XMLHttpRequest | null = null;
   private onProgress: (p: UploadProgress) => void;
 
   constructor(file: File, uploadUri: string, onProgress: (p: UploadProgress) => void) {
@@ -35,62 +36,92 @@ export class ResumableChunkUploader {
       const chunk = this.file.slice(startByte, endByte);
       const startTime = Date.now();
 
-      try {
-        const result = await this.uploadChunkXHR(chunk, startByte, endByte - 1, this.file.size);
+      let chunkSuccess = false;
+      let attempt = 0;
+      const maxRetries = 6;
 
-        if (result.status === 200 || result.status === 201) {
-          let videoId = '';
-          try {
-            const data = JSON.parse(result.responseText);
-            videoId = data.id || '';
-          } catch {}
-
-          this.onProgress({
-            bytesUploaded: this.file.size,
-            totalBytes: this.file.size,
-            percentage: 100,
-            speedMBps: 0,
-          });
-
-          return { videoId };
+      while (!chunkSuccess && attempt < maxRetries) {
+        if (this.isCancelled) throw new Error('Upload cancelled');
+        while (this.isPaused) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
         }
 
-        if (result.status === 308) {
-          const range = result.rangeHeader;
-          if (range) {
-            const parts = range.split('-');
-            startByte = parseInt(parts[1], 10) + 1;
-          } else {
-            startByte = endByte;
-          }
+        try {
+          const result = await this.uploadChunkXHR(chunk, startByte, endByte - 1, this.file.size);
 
-          const elapsedSec = (Date.now() - startTime) / 1000;
-          const speedMBps = chunk.size / (1024 * 1024) / (elapsedSec || 0.001);
+          if (result.status === 200 || result.status === 201) {
+            let videoId = '';
+            try {
+              const data = JSON.parse(result.responseText);
+              videoId = data.id || '';
+            } catch {}
 
-          this.onProgress({
-            bytesUploaded: startByte,
-            totalBytes: this.file.size,
-            percentage: Math.min(99, Math.round((startByte / this.file.size) * 100)),
-            speedMBps: Number(speedMBps.toFixed(2)),
-          });
-        } else {
-          throw new Error(`Google rejected chunk with status ${result.status}`);
-        }
-      } catch (err: any) {
-        if (endByte >= this.file.size) {
-          await new Promise((r) => setTimeout(r, 1200));
-          const verify = await this.checkIfCompleted();
-          if (verify.completed) {
             this.onProgress({
               bytesUploaded: this.file.size,
               totalBytes: this.file.size,
               percentage: 100,
               speedMBps: 0,
             });
-            return { videoId: verify.videoId };
+
+            return { videoId };
+          }
+
+          if (result.status === 308) {
+            const range = result.rangeHeader;
+            if (range) {
+              const parts = range.split('-');
+              startByte = parseInt(parts[1], 10) + 1;
+            } else {
+              startByte = endByte;
+            }
+
+            const elapsedSec = (Date.now() - startTime) / 1000;
+            const speedMBps = chunk.size / (1024 * 1024) / (elapsedSec || 0.001);
+
+            this.onProgress({
+              bytesUploaded: startByte,
+              totalBytes: this.file.size,
+              percentage: Math.min(99, Math.round((startByte / this.file.size) * 100)),
+              speedMBps: Number(speedMBps.toFixed(2)),
+            });
+
+            chunkSuccess = true;
+          } else {
+            throw new Error(`Google rejected chunk with status ${result.status}`);
+          }
+        } catch (err: any) {
+          attempt++;
+
+          // Check if the final chunk was already received despite socket drop
+          if (endByte >= this.file.size) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const verify = await this.checkIfCompleted();
+            if (verify.completed) {
+              this.onProgress({
+                bytesUploaded: this.file.size,
+                totalBytes: this.file.size,
+                percentage: 100,
+                speedMBps: 0,
+              });
+              return { videoId: verify.videoId };
+            }
+          }
+
+          if (attempt >= maxRetries) {
+            throw err;
+          }
+
+          // Sleep recovery delay with exponential backoff
+          const delay = Math.min(1000 * Math.pow(2, attempt), 12000);
+          await new Promise((r) => setTimeout(r, delay));
+
+          // Inquire YouTube for exact accepted bytes after sleep / network recovery
+          const serverOffset = await this.getResumedOffset();
+          if (serverOffset > startByte) {
+            startByte = serverOffset;
+            chunkSuccess = true; // Advance to next chunk from recovered byte
           }
         }
-        throw err;
       }
     }
 
@@ -116,10 +147,16 @@ export class ResumableChunkUploader {
   ): Promise<{ status: number; responseText: string; rangeHeader: string | null }> {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
+      this.activeXhr = xhr;
+
+      // 45s timeout to prevent frozen sockets when sleep mode suspends execution
+      xhr.timeout = 45000;
+
       xhr.open('PUT', this.uploadUri, true);
       xhr.setRequestHeader('Content-Range', `bytes ${startByte}-${endByte}/${totalBytes}`);
 
       xhr.onload = () => {
+        this.activeXhr = null;
         resolve({
           status: xhr.status,
           responseText: xhr.responseText,
@@ -127,7 +164,13 @@ export class ResumableChunkUploader {
         });
       };
 
+      xhr.ontimeout = () => {
+        this.activeXhr = null;
+        reject(new Error('Transmission timed out (connection suspended or slow)'));
+      };
+
       xhr.onerror = () => {
+        this.activeXhr = null;
         if (endByte + 1 >= totalBytes) {
           resolve({
             status: 200,
@@ -139,6 +182,11 @@ export class ResumableChunkUploader {
         }
       };
 
+      xhr.onabort = () => {
+        this.activeXhr = null;
+        reject(new Error('Transmission aborted'));
+      };
+
       xhr.send(chunk);
     });
   }
@@ -146,6 +194,7 @@ export class ResumableChunkUploader {
   async getResumedOffset(): Promise<number> {
     return new Promise((resolve) => {
       const xhr = new XMLHttpRequest();
+      xhr.timeout = 15000;
       xhr.open('PUT', this.uploadUri, true);
       xhr.setRequestHeader('Content-Range', `bytes */${this.file.size}`);
 
@@ -161,6 +210,7 @@ export class ResumableChunkUploader {
         resolve(0);
       };
 
+      xhr.ontimeout = () => resolve(0);
       xhr.onerror = () => resolve(0);
       xhr.send();
     });
@@ -169,6 +219,7 @@ export class ResumableChunkUploader {
   private async checkIfCompleted(): Promise<{ completed: boolean; videoId: string }> {
     return new Promise((resolve) => {
       const xhr = new XMLHttpRequest();
+      xhr.timeout = 15000;
       xhr.open('PUT', this.uploadUri, true);
       xhr.setRequestHeader('Content-Range', `bytes */${this.file.size}`);
 
@@ -185,6 +236,7 @@ export class ResumableChunkUploader {
         }
       };
 
+      xhr.ontimeout = () => resolve({ completed: false, videoId: '' });
       xhr.onerror = () => resolve({ completed: false, videoId: '' });
       xhr.send();
     });
@@ -192,6 +244,9 @@ export class ResumableChunkUploader {
 
   pause() {
     this.isPaused = true;
+    if (this.activeXhr) {
+      this.activeXhr.abort();
+    }
   }
 
   resume() {
@@ -200,5 +255,8 @@ export class ResumableChunkUploader {
 
   cancel() {
     this.isCancelled = true;
+    if (this.activeXhr) {
+      this.activeXhr.abort();
+    }
   }
 }

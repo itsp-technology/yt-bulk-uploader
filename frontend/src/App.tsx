@@ -2,10 +2,40 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { ResumableChunkUploader } from './utils/chunkUploader';
 
-const API_BASE = '';
+const API_BASE =
+  typeof window !== 'undefined' && window.location.hostname === 'localhost'
+    ? 'http://localhost:8787'
+    : '';
 const DB_NAME = 'yt_bulk_uploader_db';
 const STORE_NAME = 'video_queue';
 const SAVED_PLAYLIST_KEY = 'yt_selected_playlist_v21';
+
+// Native Screen Wake Lock to prevent system sleep during uploads
+let wakeLockSentinel: any = null;
+
+async function acquireWakeLock() {
+  if (typeof navigator !== 'undefined' && 'wakeLock' in navigator) {
+    try {
+      if (!wakeLockSentinel) {
+        wakeLockSentinel = await (navigator as any).wakeLock.request('screen');
+        wakeLockSentinel.addEventListener('release', () => {
+          wakeLockSentinel = null;
+        });
+      }
+    } catch {
+      // Gracefully continue if Wake Lock is disallowed by OS/battery saver
+    }
+  }
+}
+
+async function releaseWakeLock() {
+  if (wakeLockSentinel) {
+    try {
+      await wakeLockSentinel.release();
+    } catch {}
+    wakeLockSentinel = null;
+  }
+}
 
 interface UserProfile {
   id: string;
@@ -65,7 +95,7 @@ async function saveAllToIndexedDB(items: VideoFileItem[]) {
     const db = await openDB();
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
-    
+
     // Clear and re-save
     await new Promise<void>((resolve, reject) => {
       const clearReq = store.clear();
@@ -146,6 +176,9 @@ export default function App() {
   const videosRef = useRef<VideoFileItem[]>([]);
   videosRef.current = videos;
 
+  const isProcessingRef = useRef<boolean>(false);
+  isProcessingRef.current = isProcessing;
+
   const selectedPlaylistRef = useRef<string>('');
   selectedPlaylistRef.current = selectedPlaylist;
 
@@ -186,6 +219,39 @@ export default function App() {
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, []);
+
+  // Monitor Tab Visibility & Network Reconnection to keep Wake Lock and transmission alive
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const handleVisibilityChange = async () => {
+      if (document.visibilityState === 'visible') {
+        const isWorking = videosRef.current.some(
+          (v) => v.status === 'UPLOADING' || v.status === 'PROCESSING'
+        );
+        if (isWorking || isProcessingRef.current) {
+          await acquireWakeLock();
+        }
+      }
+    };
+
+    const handleOnline = async () => {
+      const isWorking = videosRef.current.some(
+        (v) => v.status === 'UPLOADING' || v.status === 'PROCESSING'
+      );
+      if (isWorking || isProcessingRef.current) {
+        await acquireWakeLock();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('online', handleOnline);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('online', handleOnline);
+    };
   }, []);
 
   // Save complete queue (including binary Files) into IndexedDB
@@ -239,6 +305,7 @@ export default function App() {
         indexedDB.deleteDatabase(DB_NAME);
       } catch {}
     }
+    releaseWakeLock();
     setProfile(null);
     setVideos([]);
   };
@@ -612,27 +679,37 @@ export default function App() {
     if (isProcessing) return;
 
     setIsProcessing(true);
+    await acquireWakeLock();
 
-    const runWorker = async () => {
-      while (true) {
-        const nextItem = videosRef.current.find(
-          (v) => (v.status === 'QUEUED' || v.status === 'FAILED') && Boolean(v.file)
-        );
+    try {
+      const runWorker = async () => {
+        while (true) {
+          const nextItem = videosRef.current.find(
+            (v) => (v.status === 'QUEUED' || v.status === 'FAILED') && Boolean(v.file)
+          );
 
-        if (!nextItem) break;
+          if (!nextItem) break;
 
-        updateVideo(nextItem.id, { status: 'UPLOADING' });
-        await uploadSingleVideo(nextItem);
+          updateVideo(nextItem.id, { status: 'UPLOADING' });
+          await uploadSingleVideo(nextItem);
+        }
+      };
+
+      const workers = Array.from(
+        { length: Math.min(concurrencyLimit, 3) },
+        () => runWorker()
+      );
+
+      await Promise.all(workers);
+    } finally {
+      setIsProcessing(false);
+      const stillWorking = videosRef.current.some(
+        (v) => v.status === 'UPLOADING' || v.status === 'PROCESSING'
+      );
+      if (!stillWorking) {
+        await releaseWakeLock();
       }
-    };
-
-    const workers = Array.from(
-      { length: Math.min(concurrencyLimit, 3) },
-      () => runWorker()
-    );
-
-    await Promise.all(workers);
-    setIsProcessing(false);
+    }
   };
 
   const completedCount = videos.filter((v) => v.status === 'COMPLETED').length;
@@ -662,7 +739,7 @@ export default function App() {
             ▶
           </div>
           <div>
-            <h1 style={{ fontSize: 18, fontWeight: 700 }}>YouTube Bulk Studio</h1>
+            <h1 style={{ fontSize: 18, fontWeight: 700 }}>YT Bulk Studio</h1>
             <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Live Sync & Auto-Playlist Engine</p>
           </div>
         </div>
