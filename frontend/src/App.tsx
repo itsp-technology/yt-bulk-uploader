@@ -96,7 +96,7 @@ async function saveAllToIndexedDB(items: VideoFileItem[]) {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
 
-    // Clear and re-save
+    // Clear existing records and re-sync
     await new Promise<void>((resolve, reject) => {
       const clearReq = store.clear();
       clearReq.onsuccess = () => resolve();
@@ -104,7 +104,7 @@ async function saveAllToIndexedDB(items: VideoFileItem[]) {
     });
 
     for (const item of items) {
-      // Omit uploader instance and transient blob URLs
+      // Omit active uploader instance and transient object URLs
       const { uploader, previewUrl, ...serializable } = item;
       store.put({
         ...serializable,
@@ -138,11 +138,20 @@ async function loadAllFromIndexedDB(): Promise<VideoFileItem[]> {
               preview = URL.createObjectURL(rec.file);
             } catch {}
           }
+
+          // If item already completed or has videoId, lock it as COMPLETED
+          const isDone = Boolean(rec.videoId) && (rec.status === 'COMPLETED' || rec.progress === 100);
+
           return {
             ...rec,
             previewUrl: preview,
             uploader: undefined,
-            status: rec.status === 'UPLOADING' ? ('QUEUED' as const) : rec.status,
+            status: isDone
+              ? ('COMPLETED' as const)
+              : rec.status === 'UPLOADING'
+              ? ('QUEUED' as const)
+              : rec.status,
+            progress: isDone ? 100 : rec.progress,
           };
         });
         resolve(hydrated);
@@ -173,6 +182,7 @@ export default function App() {
 
   const [videos, setVideos] = useState<VideoFileItem[]>([]);
 
+  const isHydratedRef = useRef<boolean>(false);
   const videosRef = useRef<VideoFileItem[]>([]);
   videosRef.current = videos;
 
@@ -185,7 +195,7 @@ export default function App() {
   const playlistsRef = useRef<any[]>([]);
   playlistsRef.current = playlists;
 
-  // Hydrate persistent state safely on mount from IndexedDB (Preserves Files on Refresh)
+  // Hydrate persistent state safely on mount from IndexedDB
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -200,10 +210,11 @@ export default function App() {
       if (persistedQueue.length > 0) {
         setVideos(persistedQueue);
       }
+      isHydratedRef.current = true;
     });
   }, []);
 
-  // Safe beforeunload listener to warn user if a stream is active
+  // Safe beforeunload listener to warn user if an upload stream is active
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -221,7 +232,7 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, []);
 
-  // Monitor Tab Visibility & Network Reconnection to keep Wake Lock and transmission alive
+  // Monitor Tab Visibility & Network Reconnection to keep Wake Lock alive
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -254,15 +265,13 @@ export default function App() {
     };
   }, []);
 
-  // Save complete queue (including binary Files) into IndexedDB
+  // Save complete queue (including binary Files) into IndexedDB once hydrated
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    if (videos.length > 0) {
-      saveAllToIndexedDB(videos);
-    }
+    if (typeof window === 'undefined' || !isHydratedRef.current) return;
+    saveAllToIndexedDB(videos);
   }, [videos]);
 
-  // Read URL query parameters on load
+  // Read URL query parameters on load for OAuth completion
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -448,12 +457,23 @@ export default function App() {
     setVideos((items) => items.map((item) => (item.id === id ? { ...item, ...fields } : item)));
   };
 
+  // Clear only completed uploads from memory and IndexedDB
   const clearCompleted = () => {
     setVideos((items) => {
-      const filtered = items.filter((v) => v.status !== 'COMPLETED');
-      saveAllToIndexedDB(filtered);
-      return filtered;
+      const remaining = items.filter((v) => v.status !== 'COMPLETED');
+      saveAllToIndexedDB(remaining);
+      return remaining;
     });
+  };
+
+  // Clear all videos from the queue
+  const clearAllVideos = () => {
+    if (isProcessing) {
+      const confirmed = window.confirm('An upload is currently in progress. Are you sure you want to clear all files?');
+      if (!confirmed) return;
+    }
+    setVideos([]);
+    saveAllToIndexedDB([]);
   };
 
   // Direct Playlist Attachment Action
@@ -675,8 +695,7 @@ export default function App() {
   };
 
   const startParallelUploads = async () => {
-    if (!profile) return;
-    if (isProcessing) return;
+    if (!profile || isProcessing) return;
 
     setIsProcessing(true);
     await acquireWakeLock();
@@ -739,7 +758,7 @@ export default function App() {
             ▶
           </div>
           <div>
-            <h1 style={{ fontSize: 18, fontWeight: 700 }}>YT Bulk Studio</h1>
+            <h1 style={{ fontSize: 18, fontWeight: 700 }}>YouTube Bulk Studio</h1>
             <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Live Sync & Auto-Playlist Engine</p>
           </div>
         </div>
@@ -1028,7 +1047,7 @@ export default function App() {
           }}
         >
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 16 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
               <div>
                 <h2 style={{ fontSize: 16, fontWeight: 600 }}>Upload Queue</h2>
                 <p style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
@@ -1036,22 +1055,42 @@ export default function App() {
                 </p>
               </div>
 
-              {completedCount > 0 && (
+              {/* Action Buttons: Clear Completed & Clear All */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {completedCount > 0 && (
+                  <button
+                    onClick={clearCompleted}
+                    style={{
+                      background: 'transparent',
+                      border: '1px solid #10b981',
+                      color: '#10b981',
+                      padding: '6px 12px',
+                      borderRadius: 6,
+                      fontSize: 12,
+                      cursor: 'pointer',
+                      fontWeight: 600,
+                    }}
+                  >
+                    Clear Completed ({completedCount})
+                  </button>
+                )}
+
                 <button
-                  onClick={clearCompleted}
+                  onClick={clearAllVideos}
                   style={{
                     background: 'transparent',
-                    border: '1px solid var(--border)',
-                    color: 'var(--text-secondary)',
+                    border: '1px solid #ef4444',
+                    color: '#ef4444',
                     padding: '6px 12px',
                     borderRadius: 6,
                     fontSize: 12,
                     cursor: 'pointer',
+                    fontWeight: 600,
                   }}
                 >
-                  Clear Completed
+                  Clear All Queue ({videos.length})
                 </button>
-              )}
+              </div>
             </div>
 
             <button
@@ -1185,7 +1224,7 @@ export default function App() {
                     >
                       {item.playlistAttached ? (
                         <span style={{ color: '#86efac', fontWeight: 600, fontSize: 12 }}>
-                          📁 Saved in Playlist: <b>{currentEffectivePlaylistTitle || 'Vivek'}</b> ✓
+                          📁 Saved in Playlist: <b>{currentEffectivePlaylistTitle || 'Selected Playlist'}</b> ✓
                         </span>
                       ) : (
                         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
