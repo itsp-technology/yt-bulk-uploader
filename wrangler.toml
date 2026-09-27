@@ -2,9 +2,16 @@ name = "yt-bulk-uploader"
 main = "backend/src/index.ts"
 compatibility_date = "2024-02-01"
 
+# Automatically serve built frontend assets on the same domain
 assets = { directory = "./frontend/dist", binding = "ASSETS", not_found_handling = "single-page-application" }
 
+# D1 Database Binding
 [[d1_databases]]
 binding = "DB"
 database_name = "yt-bulk-uploader-db"
 database_id = "4b62cdd7-19ff-4fb7-bde7-993e9d01ae8d"
+
+# Non-sensitive environment variables (persisted across git deploys)
+[vars]
+FRONTEND_URL = "https://yt-bulk-uploader.batch-up.workers.dev"
+GOOGLE_REDIRECT_URI = "https://yt-bulk-uploader.batch-up.workers.dev/api/auth/callback"
