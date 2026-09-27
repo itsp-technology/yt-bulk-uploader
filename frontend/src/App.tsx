@@ -9,6 +9,7 @@ const API_BASE =
 const DB_NAME = 'yt_bulk_uploader_db';
 const STORE_NAME = 'video_queue';
 const SAVED_PLAYLIST_KEY = 'yt_selected_playlist_v21';
+const SAVE_DEBOUNCE_MS = 1000;
 
 // Native Screen Wake Lock to prevent system sleep during uploads
 let wakeLockSentinel: any = null;
@@ -35,6 +36,20 @@ async function releaseWakeLock() {
     } catch {}
     wakeLockSentinel = null;
   }
+}
+
+function safeRevokeObjectUrl(url?: string) {
+  if (url && url.startsWith('blob:')) {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {}
+  }
+}
+
+function tryAbortUploader(item: { uploader?: ResumableChunkUploader }) {
+  try {
+    item.uploader?.cancel();
+  } catch {}
 }
 
 interface UserProfile {
@@ -72,7 +87,6 @@ interface VideoFileItem {
   uploader?: ResumableChunkUploader;
 }
 
-// Native IndexedDB Helper to persist full binary Files across reloads
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (typeof window === 'undefined' || !window.indexedDB) {
@@ -90,13 +104,12 @@ function openDB(): Promise<IDBDatabase> {
   });
 }
 
-async function saveAllToIndexedDB(items: VideoFileItem[]) {
+async function writeQueueToIndexedDB(items: VideoFileItem[]) {
   try {
     const db = await openDB();
     const tx = db.transaction(STORE_NAME, 'readwrite');
     const store = tx.objectStore(STORE_NAME);
 
-    // Clear existing records and re-sync
     await new Promise<void>((resolve, reject) => {
       const clearReq = store.clear();
       clearReq.onsuccess = () => resolve();
@@ -104,7 +117,6 @@ async function saveAllToIndexedDB(items: VideoFileItem[]) {
     });
 
     for (const item of items) {
-      // Omit active uploader instance and transient object URLs
       const { uploader, previewUrl, ...serializable } = item;
       store.put({
         ...serializable,
@@ -139,8 +151,7 @@ async function loadAllFromIndexedDB(): Promise<VideoFileItem[]> {
             } catch {}
           }
 
-          // If item already completed or has videoId, lock it as COMPLETED
-          const isDone = Boolean(rec.videoId) && (rec.status === 'COMPLETED' || rec.progress === 100);
+          const isDone = rec.status === 'COMPLETED' || (Boolean(rec.videoId) && rec.progress === 100);
 
           return {
             ...rec,
@@ -152,6 +163,7 @@ async function loadAllFromIndexedDB(): Promise<VideoFileItem[]> {
               ? ('QUEUED' as const)
               : rec.status,
             progress: isDone ? 100 : rec.progress,
+            processingProgress: isDone ? 100 : rec.processingProgress,
           };
         });
         resolve(hydrated);
@@ -194,6 +206,33 @@ export default function App() {
 
   const playlistsRef = useRef<any[]>([]);
   playlistsRef.current = playlists;
+
+  const claimedIdsRef = useRef<Set<string>>(new Set());
+  const authFetchedRef = useRef<boolean>(false);
+
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSaveRef = useRef<VideoFileItem[] | null>(null);
+
+  const scheduleSave = (items: VideoFileItem[], immediate = false) => {
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+      saveTimeoutRef.current = null;
+    }
+
+    if (immediate) {
+      pendingSaveRef.current = null;
+      writeQueueToIndexedDB(items);
+      return;
+    }
+
+    pendingSaveRef.current = items;
+    saveTimeoutRef.current = setTimeout(() => {
+      if (pendingSaveRef.current) {
+        writeQueueToIndexedDB(pendingSaveRef.current);
+        pendingSaveRef.current = null;
+      }
+    }, SAVE_DEBOUNCE_MS);
+  };
 
   // Hydrate persistent state safely on mount from IndexedDB
   useEffect(() => {
@@ -265,15 +304,20 @@ export default function App() {
     };
   }, []);
 
-  // Save complete queue (including binary Files) into IndexedDB once hydrated
+  // Flush any pending debounced save and revoke all blob URLs on unmount
   useEffect(() => {
-    if (typeof window === 'undefined' || !isHydratedRef.current) return;
-    saveAllToIndexedDB(videos);
-  }, [videos]);
+    return () => {
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+      if (pendingSaveRef.current) {
+        writeQueueToIndexedDB(pendingSaveRef.current);
+      }
+      videosRef.current.forEach((v) => safeRevokeObjectUrl(v.previewUrl));
+    };
+  }, []);
 
-  // Read URL query parameters on load for OAuth completion
+  // Read URL query parameters on load for OAuth completion (deduplicated)
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || authFetchedRef.current) return;
 
     const params = new URLSearchParams(window.location.search);
     const idFromUrl = params.get('userId');
@@ -281,6 +325,7 @@ export default function App() {
     const activeId = idFromUrl || storedId;
 
     if (activeId) {
+      authFetchedRef.current = true;
       localStorage.setItem('yt_user_id', activeId);
       if (idFromUrl) {
         window.history.replaceState({}, document.title, window.location.pathname);
@@ -298,15 +343,23 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setProfile(data);
-      } else {
+      } else if (res.status === 401 || res.status === 403) {
         logout();
+      } else {
+        console.error('Failed to fetch user profile, status:', res.status);
       }
-    } catch {
-      logout();
+    } catch (e) {
+      console.error('Network error fetching user profile:', e);
     }
   };
 
   const logout = () => {
+    videosRef.current.forEach((v) => {
+      tryAbortUploader(v);
+      safeRevokeObjectUrl(v.previewUrl);
+    });
+    claimedIdsRef.current.clear();
+
     if (typeof window !== 'undefined') {
       localStorage.removeItem('yt_user_id');
       localStorage.removeItem(SAVED_PLAYLIST_KEY);
@@ -315,6 +368,7 @@ export default function App() {
       } catch {}
     }
     releaseWakeLock();
+    authFetchedRef.current = false;
     setProfile(null);
     setVideos([]);
   };
@@ -349,35 +403,35 @@ export default function App() {
     const found = playlists.find((p) => p.id === playlistId);
     const title = found?.snippet?.title || '';
 
-    setVideos((items) =>
-      items.map((item) =>
-        item.status === 'QUEUED' || item.status === 'FAILED'
-          ? { ...item, playlistId, playlistTitle: title, playlistAttached: false }
-          : item
-      )
+    const updated = videosRef.current.map((item) =>
+      item.status === 'QUEUED' || item.status === 'FAILED'
+        ? { ...item, playlistId, playlistTitle: title, playlistAttached: false }
+        : item
     );
+    setVideos(updated);
+    if (isHydratedRef.current) scheduleSave(updated);
   };
 
   const handleAudienceChange = (isMadeForKids: boolean) => {
     setGlobalConfig((prev) => ({ ...prev, isMadeForKids }));
-    setVideos((items) =>
-      items.map((item) =>
-        item.status === 'QUEUED' || item.status === 'FAILED'
-          ? { ...item, isMadeForKids }
-          : item
-      )
+    const updated = videosRef.current.map((item) =>
+      item.status === 'QUEUED' || item.status === 'FAILED'
+        ? { ...item, isMadeForKids }
+        : item
     );
+    setVideos(updated);
+    if (isHydratedRef.current) scheduleSave(updated);
   };
 
   const handlePrivacyChange = (privacyStatus: string) => {
     setGlobalConfig((prev) => ({ ...prev, privacy: privacyStatus }));
-    setVideos((items) =>
-      items.map((item) =>
-        item.status === 'QUEUED' || item.status === 'FAILED'
-          ? { ...item, privacyStatus }
-          : item
-      )
+    const updated = videosRef.current.map((item) =>
+      item.status === 'QUEUED' || item.status === 'FAILED'
+        ? { ...item, privacyStatus }
+        : item
     );
+    setVideos(updated);
+    if (isHydratedRef.current) scheduleSave(updated);
   };
 
   const createPlaylist = async () => {
@@ -401,21 +455,27 @@ export default function App() {
     const currentPlaylist = playlists.find((p) => p.id === selectedPlaylist);
 
     Array.from(fileList)
-      .filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(f.name))
+      .filter((f) => f.type.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi|m4v|flv|wmv|ts)$/i.test(f.name))
       .forEach((f) => {
         const existingIndex = videosRef.current.findIndex(
-          (v) => v.fileName === f.name || Math.abs(v.fileSize - f.size) < 1000
+          (v) => v.fileName === f.name && v.fileSize === f.size
         );
 
         if (existingIndex !== -1) {
-          updateVideo(videosRef.current[existingIndex].id, {
-            file: f,
-            previewUrl: typeof window !== 'undefined' ? URL.createObjectURL(f) : '',
-            status: 'QUEUED',
-            errorMessage: undefined,
-            playlistId: selectedPlaylist || videosRef.current[existingIndex].playlistId,
-            playlistTitle: currentPlaylist?.snippet?.title || videosRef.current[existingIndex].playlistTitle,
-          });
+          const existing = videosRef.current[existingIndex];
+          safeRevokeObjectUrl(existing.previewUrl);
+          updateVideo(
+            existing.id,
+            {
+              file: f,
+              previewUrl: typeof window !== 'undefined' ? URL.createObjectURL(f) : '',
+              status: 'QUEUED',
+              errorMessage: undefined,
+              playlistId: selectedPlaylist || existing.playlistId,
+              playlistTitle: currentPlaylist?.snippet?.title || existing.playlistTitle,
+            },
+            true
+          );
         } else {
           incoming.push({
             id: crypto.randomUUID(),
@@ -438,45 +498,85 @@ export default function App() {
       });
 
     if (incoming.length > 0) {
-      setVideos((prev) => [...prev, ...incoming]);
+      const merged = [...videosRef.current, ...incoming];
+      setVideos(merged);
+      if (isHydratedRef.current) scheduleSave(merged, true);
     }
   };
 
   const handleSingleFileReselect = (id: string, file: File) => {
-    updateVideo(id, {
-      file,
-      fileName: file.name,
-      fileSize: file.size,
-      previewUrl: typeof window !== 'undefined' ? URL.createObjectURL(file) : '',
-      status: 'QUEUED',
-      errorMessage: undefined,
-    });
+    const existing = videosRef.current.find((v) => v.id === id);
+    if (existing) safeRevokeObjectUrl(existing.previewUrl);
+
+    updateVideo(
+      id,
+      {
+        file,
+        fileName: file.name,
+        fileSize: file.size,
+        previewUrl: typeof window !== 'undefined' ? URL.createObjectURL(file) : '',
+        status: 'QUEUED',
+        errorMessage: undefined,
+      },
+      true
+    );
   };
 
-  const updateVideo = (id: string, fields: Partial<VideoFileItem>) => {
-    setVideos((items) => items.map((item) => (item.id === id ? { ...item, ...fields } : item)));
+  const updateVideo = (id: string, fields: Partial<VideoFileItem>, persistToStorage = false) => {
+    const nextList = videosRef.current.map((item) =>
+      item.id === id ? { ...item, ...fields } : item
+    );
+    setVideos(nextList);
+
+    if (persistToStorage && isHydratedRef.current) {
+      scheduleSave(nextList);
+    }
   };
 
-  // Clear only completed uploads from memory and IndexedDB
+  const removeVideo = (id: string) => {
+    const target = videosRef.current.find((v) => v.id === id);
+    if (target) {
+      tryAbortUploader(target);
+      safeRevokeObjectUrl(target.previewUrl);
+    }
+    claimedIdsRef.current.delete(id);
+
+    const remaining = videosRef.current.filter((v) => v.id !== id);
+    setVideos(remaining);
+    scheduleSave(remaining, true);
+  };
+
   const clearCompleted = () => {
-    setVideos((items) => {
-      const remaining = items.filter((v) => v.status !== 'COMPLETED');
-      saveAllToIndexedDB(remaining);
-      return remaining;
-    });
+    const remaining = videosRef.current.filter((v) => v.status !== 'COMPLETED');
+    const removed = videosRef.current.filter((v) => v.status === 'COMPLETED');
+    removed.forEach((v) => safeRevokeObjectUrl(v.previewUrl));
+
+    setVideos(remaining);
+    scheduleSave(remaining, true);
   };
 
-  // Clear all videos from the queue
   const clearAllVideos = () => {
-    if (isProcessing) {
-      const confirmed = window.confirm('An upload is currently in progress. Are you sure you want to clear all files?');
+    if (isProcessingRef.current) {
+      const confirmed = window.confirm(
+        'Uploads are currently in progress. Cancel all active uploads and clear the entire queue?'
+      );
       if (!confirmed) return;
     }
+
+    videosRef.current.forEach((v) => {
+      tryAbortUploader(v);
+      safeRevokeObjectUrl(v.previewUrl);
+    });
+
+    claimedIdsRef.current.clear();
+    setIsProcessing(false);
+    isProcessingRef.current = false;
+    releaseWakeLock();
+
     setVideos([]);
-    saveAllToIndexedDB([]);
+    scheduleSave([], true);
   };
 
-  // Direct Playlist Attachment Action
   const attachVideoToPlaylist = async (
     itemId: string,
     targetPlaylistId?: string,
@@ -507,121 +607,143 @@ export default function App() {
 
       if (attachRes.ok && (resData.success || resData.alreadyInPlaylist)) {
         const found = playlistsRef.current.find((p) => p.id === playlistId);
-        updateVideo(itemId, {
-          playlistAttached: true,
-          isAttachingPlaylist: false,
-          playlistId,
-          videoId: resData.videoId || item.videoId,
-          playlistTitle: found?.snippet?.title || item.playlistTitle || 'Selected Playlist',
-          playlistError: undefined,
-        });
+        updateVideo(
+          itemId,
+          {
+            playlistAttached: true,
+            isAttachingPlaylist: false,
+            playlistId,
+            videoId: resData.videoId || item.videoId,
+            playlistTitle: found?.snippet?.title || item.playlistTitle || 'Selected Playlist',
+            playlistError: undefined,
+          },
+          true
+        );
         return true;
       } else {
         const err = resData.error || 'Failed to attach video to playlist';
-        updateVideo(itemId, {
-          playlistAttached: false,
-          isAttachingPlaylist: false,
-          playlistError: err,
-        });
+        updateVideo(
+          itemId,
+          {
+            playlistAttached: false,
+            isAttachingPlaylist: false,
+            playlistError: err,
+          },
+          true
+        );
         return false;
       }
     } catch (err: any) {
-      updateVideo(itemId, {
-        playlistAttached: false,
-        isAttachingPlaylist: false,
-        playlistError: err.message,
-      });
+      updateVideo(
+        itemId,
+        {
+          playlistAttached: false,
+          isAttachingPlaylist: false,
+          playlistError: err.message,
+        },
+        true
+      );
       return false;
     }
   };
 
-  // Background Cloud Processing & Automated Playlist Attachment
-  const runBackgroundProcessingAndAttach = async (
+  // Streamlined Finalization: Attach to playlist quickly and mark as completed without spamming YouTube
+  const finalizeUploadAndAttach = async (
     itemId: string,
     videoId: string,
     targetPlaylistId?: string
   ) => {
     if (!profile) return;
 
-    let isDone = false;
-    let attempts = 0;
-    let attached = false;
+    // 1. If playlist is targeted, attach with smart backoff (max 3 tries)
+    if (targetPlaylistId) {
+      let attached = false;
+      const retryDelays = [2000, 3000, 5000];
 
-    while (targetPlaylistId && !attached && attempts < 15) {
-      attempts++;
-      await new Promise((r) => setTimeout(r, 2000));
-      const ok = await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
-      if (ok) {
-        attached = true;
-        break;
-      }
-    }
-
-    let procAttempts = 0;
-    while (!isDone && procAttempts < 30) {
-      await new Promise((r) => setTimeout(r, 3000));
-      procAttempts++;
-
-      try {
-        const res = await fetch(`${API_BASE}/api/uploads/status?videoId=${videoId}`, {
-          headers: { 'x-user-id': profile.id },
-        });
-
-        if (res.ok) {
-          const data = await res.json();
-
-          if (data.processingStatus === 'succeeded' || data.uploadStatus === 'processed') {
-            isDone = true;
-            updateVideo(itemId, {
-              status: 'COMPLETED',
-              progress: 100,
-              processingProgress: 100,
-            });
-            return;
-          }
-
-          if (data.processingStatus === 'failed' || data.uploadStatus === 'rejected') {
-            isDone = true;
-            updateVideo(itemId, {
-              status: 'FAILED',
-              errorMessage: 'YouTube processing was rejected by Google',
-            });
-            return;
-          }
-
-          const realPercentage = data.percentage > 0 ? data.percentage : Math.min(25 + procAttempts * 3, 95);
-          updateVideo(itemId, {
-            status: 'PROCESSING',
-            processingProgress: realPercentage,
-          });
+      for (let i = 0; i < retryDelays.length; i++) {
+        await new Promise((r) => setTimeout(r, retryDelays[i]));
+        const ok = await attachVideoToPlaylist(itemId, targetPlaylistId, videoId);
+        if (ok) {
+          attached = true;
+          break;
         }
-      } catch (err) {
-        console.warn('Processing status poll error:', err);
       }
     }
 
-    updateVideo(itemId, { status: 'COMPLETED', progress: 100, processingProgress: 100 });
+    // 2. Perform a single check to verify YouTube accepted the file
+    try {
+      const res = await fetch(`${API_BASE}/api/uploads/status?videoId=${videoId}`, {
+        headers: { 'x-user-id': profile.id },
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.processingStatus === 'failed' || data.uploadStatus === 'rejected') {
+          updateVideo(
+            itemId,
+            {
+              status: 'FAILED',
+              errorMessage: 'YouTube rejected the file (duplicate or unsupported codec)',
+            },
+            true
+          );
+          checkAndReleaseWakeLock();
+          return;
+        }
+      }
+    } catch {
+      // Non-fatal if status check times out; the video bytes are already uploaded
+    }
+
+    // 3. Mark complete immediately
+    updateVideo(
+      itemId,
+      {
+        status: 'COMPLETED',
+        progress: 100,
+        processingProgress: 100,
+      },
+      true
+    );
+    checkAndReleaseWakeLock();
+  };
+
+  const checkAndReleaseWakeLock = () => {
+    const stillBusy = videosRef.current.some(
+      (v) => v.status === 'UPLOADING' || v.status === 'PROCESSING'
+    );
+    if (!stillBusy && !isProcessingRef.current) {
+      releaseWakeLock();
+    }
   };
 
   const uploadSingleVideo = async (item: VideoFileItem) => {
     if (!profile) return;
     if (!item.file) {
-      updateVideo(item.id, {
-        status: 'FAILED',
-        errorMessage: 'File missing from storage. Please reselect.',
-      });
+      updateVideo(
+        item.id,
+        {
+          status: 'FAILED',
+          errorMessage: 'File missing from storage. Please reselect.',
+        },
+        true
+      );
       return;
     }
 
     const effectivePlaylistId = item.playlistId || selectedPlaylistRef.current;
     const currentPlaylist = playlists.find((p) => p.id === effectivePlaylistId);
 
-    updateVideo(item.id, {
-      status: 'UPLOADING',
-      errorMessage: undefined,
-      playlistId: effectivePlaylistId,
-      playlistTitle: currentPlaylist?.snippet?.title || item.playlistTitle,
-    });
+    updateVideo(
+      item.id,
+      {
+        status: 'UPLOADING',
+        errorMessage: undefined,
+        playlistId: effectivePlaylistId,
+        playlistTitle: currentPlaylist?.snippet?.title || item.playlistTitle,
+      },
+      true
+    );
 
     try {
       let uploadUri = item.uploadUri;
@@ -652,7 +774,7 @@ export default function App() {
         }
 
         uploadUri = data.uploadUri;
-        updateVideo(item.id, { uploadUri });
+        updateVideo(item.id, { uploadUri }, true);
       }
 
       const uploader = new ResumableChunkUploader(item.file, uploadUri!, (progress) => {
@@ -666,50 +788,70 @@ export default function App() {
       const { videoId } = await uploader.start();
 
       const finalVideoId = videoId || item.videoId;
-      updateVideo(item.id, {
-        status: 'PROCESSING',
-        progress: 100,
-        videoId: finalVideoId,
-        errorMessage: undefined,
-      });
+      updateVideo(
+        item.id,
+        {
+          status: 'PROCESSING',
+          progress: 100,
+          videoId: finalVideoId,
+          errorMessage: undefined,
+        },
+        true
+      );
 
       if (finalVideoId) {
-        runBackgroundProcessingAndAttach(item.id, finalVideoId, effectivePlaylistId);
+        finalizeUploadAndAttach(item.id, finalVideoId, effectivePlaylistId);
       } else {
-        updateVideo(item.id, { status: 'COMPLETED', progress: 100 });
+        updateVideo(item.id, { status: 'COMPLETED', progress: 100, processingProgress: 100 }, true);
+        checkAndReleaseWakeLock();
       }
     } catch (err: any) {
       console.error(`Upload error for "${item.title}":`, err);
       let displayError = err.message || 'Transmission error';
 
-      if (displayError.includes('exceeded the number of videos')) {
+      if (
+        displayError.includes('exceeded the number of videos') ||
+        displayError.includes('uploadLimitExceeded')
+      ) {
         displayError = 'Channel 24h upload limit reached. YouTube has paused new uploads.';
         setIsProcessing(false);
+        isProcessingRef.current = false;
       }
 
-      updateVideo(item.id, {
-        status: 'FAILED',
-        errorMessage: displayError,
-      });
+      updateVideo(
+        item.id,
+        {
+          status: 'FAILED',
+          errorMessage: displayError,
+        },
+        true
+      );
+    } finally {
+      claimedIdsRef.current.delete(item.id);
     }
   };
 
   const startParallelUploads = async () => {
-    if (!profile || isProcessing) return;
+    if (!profile || isProcessingRef.current) return;
 
     setIsProcessing(true);
+    isProcessingRef.current = true;
     await acquireWakeLock();
+    claimedIdsRef.current.clear();
 
     try {
       const runWorker = async () => {
-        while (true) {
+        while (isProcessingRef.current) {
           const nextItem = videosRef.current.find(
-            (v) => (v.status === 'QUEUED' || v.status === 'FAILED') && Boolean(v.file)
+            (v) =>
+              (v.status === 'QUEUED' || v.status === 'FAILED') &&
+              Boolean(v.file) &&
+              !claimedIdsRef.current.has(v.id)
           );
 
           if (!nextItem) break;
 
-          updateVideo(nextItem.id, { status: 'UPLOADING' });
+          claimedIdsRef.current.add(nextItem.id);
           await uploadSingleVideo(nextItem);
         }
       };
@@ -722,12 +864,24 @@ export default function App() {
       await Promise.all(workers);
     } finally {
       setIsProcessing(false);
-      const stillWorking = videosRef.current.some(
-        (v) => v.status === 'UPLOADING' || v.status === 'PROCESSING'
-      );
-      if (!stillWorking) {
-        await releaseWakeLock();
-      }
+      isProcessingRef.current = false;
+      checkAndReleaseWakeLock();
+    }
+  };
+
+  const retrySingleVideo = async (item: VideoFileItem) => {
+    if (!profile || isProcessingRef.current) return;
+    setIsProcessing(true);
+    isProcessingRef.current = true;
+    await acquireWakeLock();
+    claimedIdsRef.current.add(item.id);
+
+    try {
+      await uploadSingleVideo(item);
+    } finally {
+      setIsProcessing(false);
+      isProcessingRef.current = false;
+      checkAndReleaseWakeLock();
     }
   };
 
@@ -1023,7 +1177,7 @@ export default function App() {
           id="file-input"
           type="file"
           multiple
-          accept="video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
+          accept="video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v,.flv,.wmv,.ts"
           style={{ display: 'none' }}
           onChange={(e) => handleFiles(e.target.files)}
         />
@@ -1175,7 +1329,7 @@ export default function App() {
                       <span style={{ fontSize: 9, color: 'var(--text-secondary)' }}>to re-attach</span>
                       <input
                         type="file"
-                        accept="video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v"
+                        accept="video/*,.mkv,.mp4,.mov,.webm,.avi,.m4v,.flv,.wmv,.ts"
                         style={{ display: 'none' }}
                         onChange={(e) => {
                           if (e.target.files?.[0]) {
@@ -1195,7 +1349,7 @@ export default function App() {
                           item.status === 'PROCESSING' ||
                           item.status === 'COMPLETED'
                         }
-                        onChange={(e) => updateVideo(item.id, { title: e.target.value })}
+                        onChange={(e) => updateVideo(item.id, { title: e.target.value }, true)}
                         style={{
                           flex: 1,
                           padding: '6px 10px',
@@ -1234,11 +1388,15 @@ export default function App() {
                             onChange={(e) => {
                               const pid = e.target.value;
                               const pl = playlists.find((p) => p.id === pid);
-                              updateVideo(item.id, {
-                                playlistId: pid,
-                                playlistTitle: pl?.snippet?.title || '',
-                                playlistAttached: false,
-                              });
+                              updateVideo(
+                                item.id,
+                                {
+                                  playlistId: pid,
+                                  playlistTitle: pl?.snippet?.title || '',
+                                  playlistAttached: false,
+                                },
+                                true
+                              );
 
                               if (item.status === 'COMPLETED' && pid) {
                                 attachVideoToPlaylist(item.id, pid);
@@ -1293,12 +1451,12 @@ export default function App() {
                       <span style={{ fontWeight: 600, color: barColor }}>
                         {isUploadingPhase && `Uploading: ${item.progress}% (${item.speedMBps} MB/s)`}
                         {isProcessingPhase &&
-                          `YouTube Processing: ${item.processingProgress || 15}% (Linking to Playlist...)`}
+                          `Finalizing: Linking to Playlist & verifying with YouTube...`}
                         {item.status === 'COMPLETED' &&
                           (item.playlistAttached
                             ? '✓ Completed & Added to Playlist'
                             : '✓ Video Uploaded')}
-                        {item.status === 'QUEUED' && (item.file ? 'Queued (Ready)' : 'Queued (Ready)')}
+                        {item.status === 'QUEUED' && (item.file ? 'Queued (Ready)' : 'File missing (Reselect)')}
                         {item.status === 'FAILED' && `Failed: ${item.errorMessage || 'Error'}`}
                       </span>
 
@@ -1329,7 +1487,7 @@ export default function App() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     {item.status === 'FAILED' && item.file && (
                       <button
-                        onClick={() => uploadSingleVideo(item)}
+                        onClick={() => retrySingleVideo(item)}
                         style={{
                           padding: '4px 8px',
                           borderRadius: 6,
@@ -1344,7 +1502,7 @@ export default function App() {
                       </button>
                     )}
                     <button
-                      onClick={() => setVideos((vs) => vs.filter((v) => v.id !== item.id))}
+                      onClick={() => removeVideo(item.id)}
                       disabled={item.status === 'UPLOADING' || item.status === 'PROCESSING'}
                       style={{
                         background: 'transparent',
